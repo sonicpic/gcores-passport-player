@@ -30,10 +30,17 @@ static passport_mp3_seek_plan_t seek_plan;
 static passport_mp3_frame_t range_frame;
 static bool range_mode, range_synced;
 static uint32_t range_scan_bytes, warm_frames, warm_bytes, s_seek_active_id;
-static uint32_t target_seconds, format_hz;
+static uint32_t target_seconds, format_hz, episode_duration;
 static int64_t discard_yield_at, clock_us;
 static int64_t seek_started_us;
 static bool seek_output_pending;
+static bool resume_probe_pending, resume_seek_ready;
+static bool mp3_probe_done, mp3_scanning, mp3_scan_disabled;
+static passport_mp3_prefix_t mp3_prefix;
+static passport_mp3_scan_t mp3_scan;
+static uint64_t mp3_scan_bytes;
+static int64_t mp3_scan_log_at;
+static bool playing_fm,s_network_fm;
 static bool running, paused, codec_awake, have_output, eos_flushed;
 static bool quiet;
 static command_t queued;
@@ -93,10 +100,12 @@ static int stream_resets, stream_reset_result=pdPASS;
 static uint32_t generation;
 static net_request_t last_request;
 #define NET_IDLE 1U
+#define NET_FM_READY 2U
+#define NET_FM_DECODER 4U
 #define s_net net
 static int xStreamBufferReset(int stream) { (void)stream; ++stream_resets; return stream_reset_result; }
 static uint32_t generation_next(void) { return ++generation; }
-static void xEventGroupClearBits(int event, unsigned bits) { (void)event; assert(bits==NET_IDLE); }
+static void xEventGroupClearBits(int event, unsigned bits) { (void)event; assert(bits==(NET_IDLE|NET_FM_READY|NET_FM_DECODER)); }
 static void xEventGroupSetBits(int event, unsigned bits) { (void)event; assert(bits==NET_IDLE); }
 static int xQueueSend(int queue, const void *data, int timeout) {
     assert(timeout==0);
@@ -162,6 +171,29 @@ static void send(command_type_t type, uint32_t value, const char *source) {
     pending = true;
     worker_ticks(1);
     assert(!pending);
+}
+
+static void resume_probe(void) {
+    for (int once=0;once<1;++once) {
+#include "audio_resume_probe.h"
+    }
+}
+
+#define pdMS_TO_TICKS(ms) (ms)
+static size_t xStreamBufferBytesAvailable(int stream) { (void)stream; return 0; }
+static size_t xStreamBufferReceive(int stream, void *buffer, size_t size, int ticks) {
+    (void)stream; (void)buffer; (void)size; (void)ticks; return 0;
+}
+static int scan_tick(void) {
+    for (int once=0;once<1;++once) {
+#include "audio_mp3_scan.h"
+    }
+    return 0;
+range_restart_zero:
+    return -1;
+}
+static void scan_eof(void) {
+#include "audio_mp3_scan_eof.h"
 }
 
 int main(void) {
@@ -342,6 +374,84 @@ int main(void) {
     assert(!url && !input && !pcm && quiet && s_status.state == PASSPORT_AUDIO_IDLE);
     send(CMD_PLAY, 0, "https://example.test/final.mp3");
     assert(running && !paused);
+    // Saved progress bootstraps metadata, then uses the real manual Range
+    // dispatch before opening a decoder or discarding the entire saved prefix.
+    send(CMD_PLAY,3000,"https://example.test/resume.mp3");
+    assert(resume_probe_pending && !resume_seek_ready && !decoder);
+    mp3_seek=(passport_mp3_seek_t){.valid=true,.cbr=true,.frames=137813,.audio_bytes=57600000,
+        .audio_offset=120,.sample_rate=44100,.frame_samples=1152};
+    net.total_bytes=57600120; strcpy(net.validator,"\"fixture\"");
+    resume_probe();
+    assert(!resume_probe_pending && resume_seek_ready);
+    const int resume_starts=network_starts;
+    worker_ticks(1);
+    assert(range_mode && network_starts==resume_starts+1 && !resume_seek_ready && !resume_probe_pending);
+    assert(last_request.offset>47000000 && discard_samples==44100 && position_base_samples==2999ULL*44100);
+    assert(!decoder && !have_output && s_status.position_seconds==3000);
+    // An RSS/size plan must reuse precisely the same automatic Range dispatch.
+    send(CMD_PLAY,1236,"https://example.test/old-no-index.mp3");
+    unsigned char proportional_frame[417]={255,251,144};
+    assert(passport_mp3_seek_proportional(&mp3_seek,proportional_frame,
+                                        sizeof(proportional_frame),5645,83828613,5238));
+    net.total_bytes=83828613; strcpy(net.validator,"\"fixture\"");
+    resume_probe(); assert(resume_seek_ready);
+    worker_ticks(1);
+    assert(range_mode && s_status.position_approximate && s_status.duration_seconds==5238);
+    assert(last_request.offset>19700000 && last_request.offset<19800000);
+    assert(discard_samples==44100 && position_base_samples==1235ULL*44100);
+    // A pause arriving between metadata and the automatic seek stays silent.
+    send(CMD_PLAY,1000,"https://example.test/paused-resume.mp3");
+    mp3_seek=(passport_mp3_seek_t){.valid=true,.cbr=true,.frames=137813,.audio_bytes=57600000,
+        .audio_offset=120,.sample_rate=44100,.frame_samples=1152};
+    net.total_bytes=57600120; strcpy(net.validator,"\"fixture\"");
+    resume_probe(); send(CMD_PAUSE,1,NULL);
+    assert(paused && resume_seek_ready);
+    worker_ticks(1);
+    assert(paused && range_mode && !resume_seek_ready && s_status.state==PASSPORT_AUDIO_PAUSED);
+    // Lack of a strong resource validator preserves the exact fallback and
+    // cannot repeatedly restart/probe while sequential PCM catches up.
+    send(CMD_PLAY,3000,"https://example.test/no-validator.mp3");
+    mp3_seek=(passport_mp3_seek_t){.valid=true,.cbr=true,.frames=137813,.audio_bytes=57600000,
+        .audio_offset=120,.sample_rate=44100,.frame_samples=1152};
+    net.total_bytes=57600120;
+    resume_probe();
+    assert(!resume_probe_pending && !resume_seek_ready && !range_mode);
+    resume_probe_pending=true; mp3_seek.valid=false; strcpy(net.validator,"\"fixture\"");
+    resume_probe();
+    assert(!resume_probe_pending && !resume_seek_ready);
+    // An accepted newer PLAY takes priority over a prepared automatic seek.
+    mp3_seek.valid=true; resume_probe_pending=true; resume_probe();
+    assert(resume_seek_ready);
+    send(CMD_PLAY,0,"https://example.test/replacement.mp3");
+    assert(!resume_seek_ready && !resume_probe_pending && !range_mode && target_seconds==0);
+    // Exercise the real encoded-scan transition, not a duplicated PCM/time
+    // calculation: mixed bitrates consume frames until one-second preroll.
+    mp3_scanning=true; target_seconds=3; mp3_scan=(passport_mp3_scan_t){0};
+    mp3_scan_bytes=0; mp3_seek.valid=false; mp3_seek.sample_rate=0;
+    for (unsigned n=0;n<77;++n) {
+        memset(input,0,INPUT_BYTES); input[0]=255; input[1]=251;
+        input[2]=n%2 ? 0xb0 : 0x90;
+        passport_mp3_frame_t f; assert(passport_mp3_header(input,&f));
+        input_length=f.bytes; input_offset=0;
+        assert(scan_tick()==0 && input_offset==f.bytes && mp3_scanning && !range_mode);
+    }
+    input_offset=0;
+    assert(scan_tick()==0 && !mp3_scanning && range_mode && range_synced);
+    assert(position_base_samples==77U*1152U && discard_samples==3U*44100-position_base_samples);
+    assert(mp3_seek.sample_rate==44100 && !mp3_seek.valid && !s_status.position_approximate);
+    // Targets past the actual EOF finish at counted audio time. A final ID3v1
+    // tag is consumed without interpreting it as a corrupt MPEG frame.
+    mp3_scanning=true; range_mode=false; net.done=true;
+    memset(input,0,128); memcpy(input,"TAG",3); input_length=128; input_offset=0;
+    assert(scan_tick()==0 && input_offset==128 && mp3_scanning);
+    have_output=false; decoded_samples=0; scan_eof();
+    assert(!mp3_scanning && have_output && position_base_samples==77U*1152U);
+    assert(s_status.duration_seconds==2 && s_status.sample_rate==44100);
+    // STOP cancels compressed scanning before another frame can be consumed.
+    mp3_scanning=true;
+    send(CMD_STOP,0,NULL);
+    assert(!mp3_scanning && !running && !input && !pcm);
+    send(CMD_PLAY,0,"https://example.test/final.mp3");
     // Known Info + authenticated whole resource selects bounded Range even
     // for a 50-minute jump; sample cursor becomes local to the Range origin.
     mp3_seek=(passport_mp3_seek_t){.valid=true,.cbr=true,.frames=137813,.audio_bytes=57600000,
@@ -375,5 +485,18 @@ int main(void) {
     assert(s_seek_active_id==6 && paused);
     send(CMD_STOP, 0, NULL);
     assert(network_cancels > 0 && !url && !input && !pcm);
+    // Station commands retain a dedicated transport and cannot reuse podcast
+    // bytes on resume. Pause remains silent; resume opens a fresh station URL.
+    queued=(command_t){.type=CMD_PLAY,.fm=true,.url=strdup("https://example.test/station")};
+    pending=true;worker_ticks(1);
+    assert(playing_fm && s_network_fm && s_status.fm && !s_status.seek_supported);
+    send(CMD_PAUSE,1,NULL);assert(paused);
+    int station_starts=network_starts;
+    send(CMD_PAUSE,0,NULL);
+    assert(!paused && playing_fm && network_starts==station_starts+1 && !strcmp(url,"https://www.gcores.com/radios#fm"));
+    send(CMD_STOP,0,NULL);
+    send(CMD_PLAY,0,"https://example.test/podcast.mp3");
+    assert(!playing_fm && !s_network_fm && !s_status.fm && s_status.seek_supported);
+    send(CMD_STOP,0,NULL);
     puts("Passport audio actual dispatch/PCM: PASS (continuous forward, sample boundary, pause, EOF/fallback, bounded yield)");
 }

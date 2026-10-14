@@ -15,7 +15,7 @@ repository root:
 
 The static gate checks documentation/languages/links, repository safety and host
 regressions. It covers catalog/cache/RSS/timeline, navigation, progress saving,
-Wi-Fi rollback, audio/HTTP/range logic and BSP failures. Firmware validation
+Wi-Fi rollback and dual-profile failover, FM manifests/segments/programme metadata, audio/HTTP/range logic and BSP failures. Firmware validation
 builds a fresh isolated configuration from `sdkconfig.defaults`, verifies the
 partition layout and archives a matching merged image, application, ELF and MAP.
 
@@ -32,7 +32,7 @@ ELF belonging to the installed image. See the [build guide](engineering/build-an
 
 ## Native UI checks
 
-The native renderer compiles actual UI code/fonts with LVGL and a 32 KiB pool.
+The native renderer compiles actual UI code/fonts with LVGL and a 28 KiB pool.
 It covers all main/subpages, channel colors, volume/battery fill, complete long
 strings, scrolling across unchanged updates, screen-off/wake, feedback lifetime,
 repeated page teardown and memory integrity. Fixtures use synthetic display data.
@@ -42,13 +42,16 @@ See [render setup](../../assets/gcores/README.md).
 ## On-device acceptance
 
 1. Identify the target device, verified artifact and intended write offset.
-   Preserve NVS/PHY only through a verified compatible application-only update.
+   Preserve NVS/PHY through verified compatible segmented writes; the first
+   catalog-partition upgrade also requires the matching partition table.
 2. Check startup, the current UI, longest titles, all three keys, channel changes,
    settings, help and returning to the playing episode without restart.
 3. Test first setup, bad credentials, retry, changing networks, setup exit and
-   automatic hotspot shutdown. Verify time synchronization before HTTPS loading.
+   automatic hotspot shutdown. Test one-profile and two-profile submissions, Chinese SSIDs and fallback to the second saved network. Verify time synchronization before HTTPS loading.
 4. Test playback, pause/resume, forward/backward seek, unsupported media,
-   network interruption, progress saving/restart and repeated stream replacement.
+   network interruption, per-episode progress after switching/restart and repeated
+   stream replacement. Browse beyond five episodes, refresh all five channels,
+   and reopen the marked episode after reordering or RSS eviction.
 5. Exercise screen-off playback, wake consumption, timers and deep sleep.
    Inspect heap/largest-block/stack watermarks and observe a prolonged session.
 6. Measure current on battery under comparable volume/media/network conditions

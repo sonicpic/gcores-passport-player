@@ -2,24 +2,29 @@
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
+#include <time.h>
 #include "bsp_button.h"
 #include "passport_audio.h"
 #include "passport_catalog.h"
+#include "passport_history.h"
 #include "passport_logic.h"
 #include "passport_ui.h"
 #include "passport_wifi.h"
 
 typedef struct { bsp_btn_t key; bsp_btn_ev_t event; } input_t;
-typedef enum { JOB_REFRESH, JOB_CHAPTERS, JOB_SAVE, JOB_PREPARE_PLAY } job_kind_t;
+typedef enum { JOB_REFRESH, JOB_CHAPTERS, JOB_SAVE, JOB_PREPARE_PLAY, JOB_START_FM } job_kind_t;
 typedef struct { job_kind_t kind; int channel,episode; uint32_t position; bool completed; } job_t;
-typedef struct { job_kind_t kind; esp_err_t error; bool ready,restart,paused; int channel,episode; uint32_t position,restart_position; } result_t;
+typedef struct { job_kind_t kind; esp_err_t error; bool ready,restart,paused,restore_seek; int channel,episode; uint32_t position,restart_position; } result_t;
 typedef void *TaskHandle_t;
 typedef void *QueueHandle_t;
 typedef enum {eRunning,eSuspended} eTaskState;
 #define pdTRUE 1
 #define pdPASS 1
 #define MALLOC_CAP_8BIT 1
+#define ESP_ERR_NOT_FOUND 0x105
 #define ESP_LOGI(...) ((void)0)
+#undef ESP_LOGW
+#define ESP_LOGW(...) ((void)0)
 static QueueHandle_t jobs=(void *)1,results=(void *)2;
 static TaskHandle_t catalog_worker;
 static job_t queued_job;
@@ -34,12 +39,12 @@ static passport_page_t page;
 static passport_page_t return_page[PASSPORT_PAGE_TIMELINE_TEXT+1];
 static int channel,selected,menu_selected,playing_channel,current_channel;
 static passport_episode_t current;
-static bool prepared_play;
+static bool prepared_play,current_fm;
 static int current_episode;
 static uint32_t initial_resume,history_position;
 static int volume,sleep_minutes,brightness,screen_timeout_index,battery;
 static const uint32_t screen_timeouts[]={15,30,60,120,300,0};
-static char chapter_line[220],next_chapter_line[220],details[5][64],rows[5][385];
+static char chapter_line[220],next_chapter_line[385],details[5][64],rows[5][385];
 static passport_view_t rendered;
 bool bsp_lvgl_lock(uint32_t timeout) { (void)timeout; return true; }
 void bsp_lvgl_unlock(void) {}
@@ -47,6 +52,32 @@ void passport_ui_update(const passport_view_t *view) { rendered=*view; }
 static int64_t last_input,last_save,sleep_deadline,portal_started,scrub_released_at;
 static bool busy,dark,dirty,settings_dirty,scrub_was_paused,sleep_requested,audio_ok,portal_close_failed;
 static bool ui_activity_pending;
+static bool refreshing_catalog;
+static int64_t catalog_last_success,catalog_attempted_day;
+static unsigned refresh_success_saves;
+typedef unsigned nvs_handle_t;
+#define NVS_READWRITE 1
+static time_t utc_clock;
+static esp_err_t nvs_open_error,nvs_set_error,nvs_commit_error,play_error;
+static unsigned nvs_opens,nvs_sets,nvs_commits,nvs_closes;
+static int64_t nvs_pending_stamp,nvs_persisted_stamp;
+time_t time(time_t *out) { if(out) *out=utc_clock; return utc_clock; }
+esp_err_t nvs_open(const char *name,int mode,nvs_handle_t *out) {
+    assert(!strcmp(name,"gpp_settings") && mode==NVS_READWRITE);++nvs_opens;
+    if(nvs_open_error==ESP_OK) *out=42;
+    return nvs_open_error;
+}
+static esp_err_t nvs_set_i64(nvs_handle_t h,const char *key,int64_t value) {
+    assert(h==42 && !strcmp(key,"catalog_updated"));++nvs_sets;
+    if(nvs_set_error==ESP_OK) nvs_pending_stamp=value;
+    return nvs_set_error;
+}
+esp_err_t nvs_commit(nvs_handle_t h) {
+    assert(h==42);++nvs_commits;
+    if(nvs_commit_error==ESP_OK) {nvs_persisted_stamp=nvs_pending_stamp;++refresh_success_saves;}
+    return nvs_commit_error;
+}
+void nvs_close(nvs_handle_t h) { assert(h==42);++nvs_closes; }
 static passport_screen_guard_t screen_guard;
 static bsp_btn_t scrub_key;
 static passport_scrub_t scrub;
@@ -55,7 +86,8 @@ static char notice[240];
 
 static int64_t clock_us;
 static unsigned seeks,pauses,volume_sets,backlights,ends,starts,saves,plays,job_starts,playback_saves;
-static uint32_t last_seek;
+static uint32_t last_seek,last_play_position;
+static char last_play_url[1025];
 static int last_volume,last_backlight;
 static bool pause_commands[8],provisioning,connected;
 static esp_err_t exit_error,seek_error,pause_error;
@@ -64,12 +96,30 @@ static uint32_t last_job_position;
 static passport_audio_status_t audio;
 static passport_episode_t catalog_episode;
 static int catalog_count,catalog_index;
-static bool chapter_fixture;
+static unsigned identity_lookups;
+static bool refresh_reorder;
+static bool history_found;
+static passport_history_progress_t saved_history;
+bool passport_history_lookup(int c,const char *guid,passport_history_progress_t *out) {
+    (void)c;(void)guid;if(!history_found) return false;*out=saved_history;return true;
+}
+static unsigned refresh_mask;
+static int refresh_fail_channel=-1;
+static unsigned playback_pins,chapter_fetches,timeline_releases,chapter_attempts,retry_delays,fm_starts,stops;
+static bool chapter_fixture,timeline_ready=true,before_first;
+static esp_err_t chapter_error=ESP_OK,chapter_retry_error=ESP_OK;
 int64_t esp_timer_get_time(void) { return clock_us; }
 const char *esp_err_to_name(esp_err_t error) { return error==ESP_OK?"ESP_OK":"ESP_FAIL"; }
-static esp_err_t stop_wait(void) { return stop_error; }
+static esp_err_t stop_wait(void) { ++stops; return stop_error; }
 static void settings_save(void) { ++saves; }
-esp_err_t save_playback(uint32_t position,bool completed) { (void)position; (void)completed; ++playback_saves; return ESP_OK; }
+esp_err_t passport_history_save(int c,const char *guid,uint32_t position,uint32_t duration,bool completed) {
+    assert(c>=0 && c<5 && guid[0]); (void)position;(void)duration;(void)completed;++playback_saves;return ESP_OK;
+}
+esp_err_t passport_catalog_save_playback(const passport_resume_t *snapshot) { assert(snapshot->guid[0]);return ESP_OK; }
+bool passport_catalog_timeline_ready(int c,const char *guid,const char *url) { (void)c;(void)guid;(void)url;return timeline_ready; }
+void passport_catalog_release_timeline(void) { ++timeline_releases; }
+#define pdMS_TO_TICKS(x) (x)
+void vTaskDelay(unsigned ticks) { assert(ticks==200); ++retry_delays; }
 static int xQueueSend(QueueHandle_t queue,const void *value,unsigned timeout) {
     (void)timeout; if(send_fail) return 0;
     if(queue==jobs) {queued_job=*(const job_t *)value;job_queued=true;last_job_kind=queued_job.kind;last_job_position=queued_job.position;job_starts++;}
@@ -88,8 +138,20 @@ static int xTaskCreate(void (*entry)(void *),const char *name,unsigned stack,voi
 static eTaskState eTaskGetState(TaskHandle_t task) {assert(task==catalog_worker);return task_state;}
 static void vTaskDelete(TaskHandle_t task) {assert(task==catalog_worker&&task_state==eSuspended);task_deletes++;deleted=true;}
 static void vTaskSuspend(TaskHandle_t task) {assert(!task);task_state=eSuspended;longjmp(suspended_jump,1);}
-esp_err_t passport_catalog_refresh(int c) {(void)c;return catalog_error;}
-esp_err_t passport_catalog_fetch_chapters(int c,int e) {(void)c;(void)e;return catalog_error;}
+esp_err_t passport_catalog_refresh(int c) {
+    refresh_mask|=1u<<c;
+    if(refresh_reorder && catalog_error==ESP_OK) catalog_index=4;
+    return c==refresh_fail_channel?ESP_FAIL:catalog_error;
+}
+esp_err_t passport_catalog_fetch_chapters(int c,int e) {(void)c;(void)e;return chapter_attempts++?chapter_retry_error:chapter_error;}
+esp_err_t passport_catalog_set_playback(int c,const passport_episode_t *episode) {
+    assert(c>=0 && c<PASSPORT_CHANNEL_COUNT && episode && episode->url[0]);
+    ++playback_pins;return ESP_OK;
+}
+esp_err_t passport_catalog_fetch_chapters_for_episode(int c,const passport_episode_t *episode) {
+    assert(c>=0 && c<PASSPORT_CHANNEL_COUNT && episode && episode->url[0]);
+    ++chapter_fetches;return catalog_error;
+}
 void bsp_display_backlight(int brightness_percent) { ++backlights; last_backlight=brightness_percent; }
 esp_err_t passport_audio_seek(uint32_t seconds) {
     ++seeks; last_seek=seconds;
@@ -100,7 +162,13 @@ esp_err_t passport_audio_pause(bool paused) {
     assert(pauses<8); pause_commands[pauses++]=paused; return pause_error;
 }
 esp_err_t passport_audio_set_volume(uint8_t percent) { ++volume_sets; last_volume=percent; return ESP_OK; }
-esp_err_t passport_audio_play(const char *url,uint32_t position) { (void)url; (void)position; if(require_freed) assert(deleted && !catalog_worker); ++plays; return ESP_OK; }
+esp_err_t passport_audio_play(const char *url,uint32_t position,uint32_t duration) {
+    (void)duration;
+    if(require_freed) assert(deleted && !catalog_worker);
+    snprintf(last_play_url,sizeof(last_play_url),"%s",url);last_play_position=position;
+    ++plays;return play_error;
+}
+esp_err_t passport_audio_fm(void) { if(require_freed) assert(deleted && !catalog_worker);++fm_starts;return play_error; }
 void passport_audio_get_status(passport_audio_status_t *out) { *out=audio; }
 bool passport_wifi_provisioning(void) { return provisioning; }
 bool passport_wifi_connected(void) { return connected; }
@@ -115,32 +183,56 @@ bool passport_catalog_get_episode(int c,int e,passport_episode_t *out) {
     (void)c; if (e<0 || e>=catalog_count) return false; *out=catalog_episode; if (e!=catalog_index) snprintf(out->guid,sizeof(out->guid),"other-%d",e); return true;
 }
 int passport_catalog_find_episode_by_identity(int c,const char *guid,const char *url) {
-    (void)c; return !strcmp(guid,catalog_episode.guid) && !strcmp(url,catalog_episode.url)?catalog_index:-1;
+    (void)c;++identity_lookups;
+    return catalog_count>catalog_index && !strcmp(guid,catalog_episode.guid) && !strcmp(url,catalog_episode.url)?catalog_index:-1;
 }
 size_t passport_catalog_chapter_count(int c,int e) { (void)c; (void)e; return 0; }
+size_t passport_catalog_chapter_count_by_identity(int c,const char *guid,const char *url) {
+    assert(c==current_channel && !strcmp(guid,current.guid) && !strcmp(url,current.url));
+    return chapter_fixture?2:0;
+}
 bool passport_catalog_get_chapter(int c,int e,size_t i,passport_chapter_t *out) {
     (void)c; (void)e; if (!chapter_fixture || i>1) return false; out->start_seconds=i?600:300; strcpy(out->title,i?"下一章节":"当前章节"); return true;
 }
 bool passport_catalog_current_chapter(int c,int e,uint32_t position,passport_chapter_t *out,size_t *index) {
-    (void)position; if (!chapter_fixture) return false; if (index) *index=0; return passport_catalog_get_chapter(c,e,0,out);
+    (void)position; if (!chapter_fixture || before_first) return false; if (index) *index=0; return passport_catalog_get_chapter(c,e,0,out);
+}
+bool passport_catalog_current_chapter_by_identity(int c,const char *guid,const char *url,uint32_t position,passport_chapter_t *out,size_t *index) {
+    assert(c==current_channel && !strcmp(guid,current.guid) && !strcmp(url,current.url));
+    return passport_catalog_current_chapter(c,0,position,out,index);
+}
+bool passport_catalog_get_chapter_by_identity(int c,const char *guid,const char *url,size_t i,passport_chapter_t *out) {
+    assert(c==current_channel && !strcmp(guid,current.guid) && !strcmp(url,current.url));
+    return passport_catalog_get_chapter(c,0,i,out);
 }
 
+const char *passport_wifi_status_text(void) { return "连接中"; }
+static char fm_title[385];
+static void passport_fm_get_titles(char *a,size_t na,char *b,size_t nb) {
+    snprintf(a,na,"%s","FM current"); snprintf(b,nb,"%s","FM next");
+}
 #include "passport_main_handle.h"
 
 static void setup(passport_page_t initial) {
     catalog_worker=NULL;job_queued=result_queued=create_fail=send_fail=deleted=require_freed=false;task_creates=task_deletes=0;task_state=eRunning;catalog_error=stop_error=ESP_OK;
     page=initial; channel=selected=menu_selected=current_channel=0; playing_channel=-1;
     memset(&current,0,sizeof(current)); initial_resume=history_position=0;
-    prepared_play=false; current_episode=-1; catalog_count=5; catalog_index=0; chapter_fixture=false;
+    prepared_play=current_fm=false; current_episode=-1; catalog_count=5; catalog_index=0; chapter_fixture=false;
+    timeline_ready=true;before_first=false;timeline_releases=chapter_attempts=retry_delays=fm_starts=stops=0;chapter_error=chapter_retry_error=ESP_OK;
+    refresh_reorder=false;history_found=false;memset(&saved_history,0,sizeof(saved_history));refresh_mask=0;refresh_fail_channel=-1;playback_pins=chapter_fetches=0;
     volume=50; sleep_minutes=0; brightness=70; screen_timeout_index=2;
     last_input=last_save=sleep_deadline=portal_started=scrub_released_at=0;
     busy=dark=dirty=settings_dirty=scrub_was_paused=sleep_requested=portal_close_failed=false; audio_ok=true;
     ui_activity_pending=false;
+    refreshing_catalog=false; catalog_last_success=catalog_attempted_day=0; refresh_success_saves=0;
+    utc_clock=1800000000;nvs_open_error=nvs_set_error=nvs_commit_error=play_error=ESP_OK;
+    nvs_opens=nvs_sets=nvs_commits=nvs_closes=0;nvs_pending_stamp=nvs_persisted_stamp=0;
     memset(return_page,0,sizeof(return_page));
     memset(&screen_guard,0,sizeof(screen_guard)); memset(&scrub,0,sizeof(scrub)); notice[0]=0;
     memset(&seek_feedback,0,sizeof(seek_feedback));
     clock_us=1000000; seeks=pauses=volume_sets=backlights=ends=starts=saves=plays=job_starts=playback_saves=0;
-    last_seek=0; last_volume=last_backlight=-1; memset(pause_commands,0,sizeof(pause_commands));
+    last_seek=last_play_position=0;last_play_url[0]=0;identity_lookups=0;
+    last_volume=last_backlight=-1; memset(pause_commands,0,sizeof(pause_commands));
     provisioning=false; connected=true; exit_error=seek_error=pause_error=ESP_OK;
     audio=(passport_audio_status_t){.state=PASSPORT_AUDIO_PLAYING,.position_seconds=500,.duration_seconds=10000};
     memset(&catalog_episode,0,sizeof(catalog_episode));
@@ -307,7 +399,7 @@ static void test_navigation_keeps_player_without_audio_commands(void) {
     assert(page==PASSPORT_PAGE_PLAYER && plays==0 && playback_saves==0);
     /* Nested Wi-Fi returns to Settings, then Home, preserving the stream. */
     fire(BSP_BTN_OK,BSP_BTN_LONG); fire(BSP_BTN_OK,BSP_BTN_LONG);
-    menu_selected=1; fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    menu_selected=3; fire(BSP_BTN_OK,BSP_BTN_CLICK);
     assert(page==PASSPORT_PAGE_WIFI && provisioning && return_page[PASSPORT_PAGE_WIFI]==PASSPORT_PAGE_SETTINGS);
     fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(page==PASSPORT_PAGE_SETTINGS && ends==1);
     fire(BSP_BTN_OK,BSP_BTN_LONG); assert(page==PASSPORT_PAGE_LIBRARY);
@@ -330,15 +422,16 @@ static void test_home_tabs_and_selection_are_separate(void) {
 }
 static void test_settings_reindexed_without_redundant_pages(void) {
     setup(PASSPORT_PAGE_SETTINGS);
+    menu_selected=1;
     fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(job_starts==1 && last_job_kind==JOB_REFRESH);
     task_state=eSuspended; result_t done={.kind=JOB_REFRESH}; assert(finish_catalog_result(&done));
-    menu_selected=2; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(brightness==80 && settings_dirty);
-    menu_selected=3; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(screen_timeout_index==3);
-    menu_selected=4; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(sleep_minutes==15 && sleep_deadline>clock_us);
-    menu_selected=7; fire(BSP_BTN_DOWN,BSP_BTN_CLICK); assert(menu_selected==7);
+    menu_selected=3; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(brightness==80 && settings_dirty);
+    menu_selected=4; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(screen_timeout_index==3);
+    menu_selected=5; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(sleep_minutes==15 && sleep_deadline>clock_us);
+    menu_selected=8; fire(BSP_BTN_DOWN,BSP_BTN_CLICK); assert(menu_selected==8);
     fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(page==PASSPORT_PAGE_HELP);
     fire(BSP_BTN_OK,BSP_BTN_LONG); assert(page==PASSPORT_PAGE_SETTINGS);
-    menu_selected=6; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(sleep_requested && !plays && !pauses);
+    menu_selected=7; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(sleep_requested && !plays && !pauses);
 }
 static void test_render_home_identity_marker_and_next_chapter(void) {
     setup(PASSPORT_PAGE_LIBRARY); current=catalog_episode; playing_channel=current_channel=0;
@@ -354,8 +447,26 @@ static void test_render_home_identity_marker_and_next_chapter(void) {
     render(&audio); assert(rendered.channel_index==0 && strstr(rendered.current_chapter,"05:00") && strstr(rendered.next_chapter,"10:00"));
     chapter_fixture=false; render(&audio); assert(!rendered.current_chapter && !rendered.next_chapter);
     page=PASSPORT_PAGE_SETTINGS; menu_selected=0; render(&audio);
-    assert(rendered.item_count==5 && !strcmp(rendered.titles[0],"更新播客列表") && !strcmp(rendered.titles[1],"Wi-Fi 配网"));
-    menu_selected=7; render(&audio); assert(rendered.item_count==3 && rendered.selected==2 && !strcmp(rendered.titles[2],"按键帮助"));
+    assert(rendered.item_count==5 && !strcmp(rendered.titles[0],"回到当前播放") && rendered.row_highlight[0] && !strcmp(rendered.titles[1],"机核 FM") && rendered.row_icon[0]==1 && rendered.row_icon[1]==2 && !strcmp(rendered.titles[2],"更新播客列表"));
+    menu_selected=9; render(&audio); assert(rendered.item_count==5 && rendered.selected==4 && !strcmp(rendered.titles[4],"按键帮助"));
+}
+static void test_channel_is_part_of_playback_identity(void) {
+    setup(PASSPORT_PAGE_LIBRARY);current=catalog_episode;playing_channel=current_channel=0;channel=1;
+    render(&audio);assert(rendered.row_playback[0]==0);
+    play(0,false);
+    assert(page==PASSPORT_PAGE_LIBRARY && plays==0 && job_starts==1 && last_job_kind==JOB_PREPARE_PLAY);
+    prepared_play=true;play(0,false);prepared_play=false;
+    assert(plays==1 && current_channel==1 && playing_channel==1);
+}
+static void test_timeline_survives_directory_eviction_without_lookup(void) {
+    setup(PASSPORT_PAGE_PLAYER);current=catalog_episode;playing_channel=current_channel=0;chapter_fixture=true;
+    catalog_count=0;channel=3;identity_lookups=0;
+    render(&audio);
+    assert(rendered.channel_index==0 && rendered.current_chapter && rendered.next_chapter);
+    assert(strstr(rendered.current_chapter,"05:00") && strstr(rendered.next_chapter,"10:00"));
+    assert(identity_lookups==0); /* Periodic render must not scan the paged Flash directory. */
+    audio.state=PASSPORT_AUDIO_PAUSED;audio.position_seconds=540;
+    render(&audio);assert(rendered.current_chapter && rendered.position_seconds==540 && identity_lookups==0);
 }
 static void run_catalog_worker(void) {
     assert(catalog_worker && job_queued);
@@ -390,11 +501,186 @@ static void test_catalog_worker_reclaimed_before_audio(void) {
     assert(finish_catalog_result(&result) && plays==0 && task_deletes==1);
     setup(PASSPORT_PAGE_LIBRARY);create_fail=true;
     assert(!begin(JOB_PREPARE_PLAY,0,0,0,false));assert(!busy && !catalog_worker && !job_queued && task_deletes==0);
-    create_fail=false;assert(begin(JOB_SAVE,0,0,500,false));run_catalog_worker();
+    create_fail=false;current=catalog_episode;playing_channel=0;assert(begin(JOB_SAVE,0,0,500,false));run_catalog_worker();
     assert(xQueueReceive(results,&result,0)==pdTRUE);assert(finish_catalog_result(&result));
     assert(plays==0 && task_deletes==1 && playback_saves==1);
     setup(PASSPORT_PAGE_LIBRARY);send_fail=true;
     assert(!begin(JOB_REFRESH,0,0,0,false) && !busy && task_creates==0 && !catalog_worker);
+}
+static void test_refresh_keeps_accepted_seek_and_pause_intent(void) {
+    const bool paused_intent[]={false,true};
+    for(unsigned i=0;i<2;++i) {
+        setup(PASSPORT_PAGE_SETTINGS);current=catalog_episode;playing_channel=current_channel=0;
+        audio.state=PASSPORT_AUDIO_BUFFERING;audio.position_seconds=100;
+        seek_feedback.active=true;seek_feedback.target=730;seek_feedback.paused=paused_intent[i];
+        seek_feedback.request_id=9;audio.seek_request_id=9;audio.seeking=true;history_position=730;
+        if(i) catalog_error=ESP_FAIL; /* Refresh failure must not change the retained playback intent. */
+        assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();
+        result_t result;assert(xQueueReceive(results,&result,0)==pdTRUE);
+        assert(result.restart && result.ready && result.restore_seek && result.restart_position==730);
+        assert(result.paused==paused_intent[i]);
+        passport_audio_status_t stopped={.state=PASSPORT_AUDIO_IDLE};
+        seek_feedback_observe(&stopped);assert(seek_feedback.active); /* Maintenance STOP is not user cancellation. */
+        assert(finish_catalog_result(&result));
+        assert(plays==1 && last_play_position==730 && !strcmp(last_play_url,current.url));
+        assert(pauses==i && history_position==730);
+        if(i) assert(pause_commands[0]);
+        assert(result.error==(i?ESP_FAIL:ESP_OK));
+        assert(seek_feedback.active && seek_feedback.target==730 && seek_feedback.paused==paused_intent[i]);
+        passport_view_t retained={.position_seconds=0,.playback_state="BUFFER"};
+        seek_feedback_view(&retained);assert(retained.position_seconds==730);
+        audio.state=paused_intent[i]?PASSPORT_AUDIO_PAUSED:PASSPORT_AUDIO_BUFFERING;
+        audio.seeking=false;seek_feedback_observe(&audio);assert(seek_feedback.active);
+        audio.state=PASSPORT_AUDIO_PLAYING;audio.seek_complete_id=seek_feedback.request_id;
+        seek_feedback_observe(&audio);assert(!seek_feedback.active);
+    }
+    setup(PASSPORT_PAGE_SETTINGS);current=catalog_episode;playing_channel=current_channel=0;
+    audio.state=PASSPORT_AUDIO_BUFFERING;audio.position_seconds=0;history_position=912;
+    assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();
+    result_t result;assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(result.restart && result.restart_position==912);
+    assert(finish_catalog_result(&result) && plays==1 && last_play_position==912);
+}
+static void test_refresh_preserves_selected_identity_after_reorder(void) {
+    setup(PASSPORT_PAGE_SETTINGS);current=catalog_episode;playing_channel=current_channel=0;
+    strcpy(current.title,"Playing snapshot");strcpy(catalog_episode.title,"Updated feed title");
+    selected=catalog_index=0;refresh_reorder=true;
+    assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();
+    result_t result;assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(finish_catalog_result(&result));
+    assert(selected==4 && plays==1 && last_play_position==500);
+    assert(!strcmp(current.title,"Playing snapshot") && !strcmp(current.guid,"episode-guid"));
+    page=PASSPORT_PAGE_LIBRARY;fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    assert(page==PASSPORT_PAGE_PLAYER && plays==1); /* Reopening is navigation, not a second play. */
+}
+static void test_refresh_updates_every_channel_after_partial_failure(void) {
+    setup(PASSPORT_PAGE_SETTINGS);refresh_fail_channel=2;refresh_reorder=true;
+    selected=catalog_index=0;
+    assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();
+    result_t result;assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(refresh_mask==((1u<<PASSPORT_CHANNEL_COUNT)-1));
+    assert(result.error==ESP_FAIL && result.ready && result.episode==4);
+    assert(finish_catalog_result(&result) && selected==4);
+}
+static void test_per_episode_resume_before_preparation(void) {
+    setup(PASSPORT_PAGE_LIBRARY);audio.state=PASSPORT_AUDIO_IDLE;current.url[0]=0;
+    history_found=true;saved_history=(passport_history_progress_t){712,2000,false};
+    play(0,false);assert(last_job_kind==JOB_PREPARE_PLAY && last_job_position==712);
+    setup(PASSPORT_PAGE_LIBRARY);audio.state=PASSPORT_AUDIO_IDLE;current.url[0]=0;
+    history_found=true;saved_history=(passport_history_progress_t){2000,2000,true};
+    play(0,false);assert(last_job_kind==JOB_PREPARE_PLAY && last_job_position==0);
+    setup(PASSPORT_PAGE_LIBRARY);audio.state=PASSPORT_AUDIO_IDLE;current.url[0]=0;
+    history_found=true;saved_history=(passport_history_progress_t){712,2000,false};
+    play(99,true);assert(last_job_position==99);
+}
+static void test_conditional_settings_return_is_navigation(void) {
+    setup(PASSPORT_PAGE_SETTINGS); current=catalog_episode; /* Restored boot snapshot is not a session. */
+    render(&audio); assert(!strcmp(rendered.titles[0],"机核 FM") && rendered.row_highlight[0] && rendered.row_icon[0]==2 && !strcmp(rendered.titles[1],"更新播客列表"));
+    playing_channel=0; render(&audio);
+    assert(!strcmp(rendered.titles[0],"回到当前播放") && rendered.row_highlight[0]);
+    fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    assert(page==PASSPORT_PAGE_PLAYER && plays==0 && seeks==0 && pauses==0 && job_starts==0);
+    page=PASSPORT_PAGE_SETTINGS; menu_selected=4; fire(BSP_BTN_OK,BSP_BTN_CLICK); assert(brightness==80);
+    menu_selected=9; fire(BSP_BTN_DOWN,BSP_BTN_CLICK); assert(menu_selected==9);
+}
+static void test_daily_refresh_and_refresh_notice(void) {
+    int64_t day_start=(int64_t)22000*86400-8*3600;
+    assert(!passport_catalog_update_due(0,0,0));
+    assert(passport_catalog_update_due(day_start,day_start-1,0)); /* Beijing midnight boundary. */
+    assert(!passport_catalog_update_due(day_start+86399,day_start,0));
+    assert(!passport_catalog_update_due(day_start,day_start+86400,0)); /* Clock corrected backward. */
+    setup(PASSPORT_PAGE_LIBRARY); audio.state=PASSPORT_AUDIO_IDLE;
+    auto_refresh_catalog(0,&audio); assert(job_starts==0);
+    catalog_last_success=day_start+1; auto_refresh_catalog(day_start+500,&audio); assert(job_starts==0);
+    catalog_last_success=day_start-1; connected=false; auto_refresh_catalog(day_start,&audio); assert(job_starts==0);
+    connected=true; audio.state=PASSPORT_AUDIO_PLAYING; auto_refresh_catalog(day_start,&audio); assert(job_starts==0);
+    audio.state=PASSPORT_AUDIO_PAUSED; auto_refresh_catalog(day_start,&audio); assert(job_starts==0);
+    audio.state=PASSPORT_AUDIO_IDLE; auto_refresh_catalog(day_start,&audio); assert(job_starts==1);
+    assert(refreshing_catalog && !strcmp(notice,"正在更新节目库，请稍后……"));
+    strcpy(notice,"网络已连接"); render(&audio); assert(!strcmp(rendered.status,"正在更新节目库，请稍后……"));
+    refresh_fail_channel=2; run_catalog_worker(); result_t result; assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(finish_catalog_result(&result) && !refreshing_catalog && refresh_success_saves==0);
+    auto_refresh_catalog(day_start+1,&audio); assert(job_starts==1); /* Failure waits until next boot/day. */
+    auto_refresh_catalog(day_start+86400,&audio); assert(job_starts==2);
+    refresh_fail_channel=-1; run_catalog_worker(); assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(finish_catalog_result(&result) && refresh_success_saves==1);
+    /* Manual update is always available, even after this day's automatic attempt. */
+    assert(begin(JOB_REFRESH,0,0,0,false)); assert(!strcmp(notice,"正在更新节目库，请稍后……"));
+    setup(PASSPORT_PAGE_LIBRARY); audio.state=PASSPORT_AUDIO_IDLE; create_fail=true;
+    auto_refresh_catalog(day_start,&audio); auto_refresh_catalog(day_start+1,&audio); assert(task_creates==1 && !busy);
+}
+static void test_actual_refresh_timestamp_transaction(void) {
+    setup(PASSPORT_PAGE_LIBRARY); utc_clock=0; catalog_refresh_succeeded();
+    assert(nvs_opens==0 && catalog_last_success==0);
+    utc_clock=1800000000; catalog_last_success=1799900000;
+    nvs_open_error=ESP_FAIL; catalog_refresh_succeeded();
+    assert(nvs_opens==1 && !nvs_sets && !nvs_closes && catalog_last_success==1799900000);
+    nvs_open_error=ESP_OK;nvs_set_error=ESP_FAIL;catalog_refresh_succeeded();
+    assert(nvs_sets==1 && !nvs_commits && nvs_closes==1 && catalog_last_success==1799900000);
+    nvs_set_error=ESP_OK;nvs_commit_error=ESP_FAIL;catalog_refresh_succeeded();
+    assert(nvs_commits==1 && nvs_closes==2 && catalog_last_success==1799900000 && nvs_persisted_stamp==0);
+    nvs_commit_error=ESP_OK;catalog_refresh_succeeded();
+    assert(nvs_commits==2 && nvs_closes==3 && catalog_last_success==utc_clock && nvs_persisted_stamp==utc_clock);
+    assert(refresh_success_saves==1);
+    /* Reboot reads the same persisted success; the pure scheduling helper must
+     * suppress another update on this date and permit the next Beijing date. */
+    int64_t persisted=nvs_persisted_stamp;catalog_last_success=catalog_attempted_day=0;
+    catalog_last_success=persisted;
+    assert(!passport_catalog_update_due(utc_clock+1,catalog_last_success,catalog_attempted_day));
+    assert(passport_catalog_update_due(utc_clock+86400,catalog_last_success,catalog_attempted_day));
+    /* A failed restart must not discard successfully refreshed RSS freshness. */
+    setup(PASSPORT_PAGE_SETTINGS); current=catalog_episode; play_error=ESP_FAIL;
+    assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();result_t result;
+    assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(finish_catalog_result(&result) && result.error==ESP_FAIL && refresh_success_saves==1);
+    assert(catalog_last_success==utc_clock);
+}
+static void test_fm_entry_lifecycle_and_no_episode_history(void) {
+    setup(PASSPORT_PAGE_SETTINGS);current=catalog_episode;playing_channel=current_channel=0;require_freed=true;
+    menu_selected=1;fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    assert(page==PASSPORT_PAGE_PLAYER && last_job_kind==JOB_START_FM && !fm_starts && !plays);
+    run_catalog_worker();result_t result;assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(result.ready && !result.restart && stops==1 && playback_saves==1 && timeline_releases==1);
+    assert(finish_catalog_result(&result));
+    assert(fm_starts==1 && !plays && current_fm && playing_channel==-1 && current_episode==-1 && !current.guid[0]);
+    assert(!strcmp(current.title,"机核 FM") && page==PASSPORT_PAGE_PLAYER && !seek_feedback.active && !scrub.active);
+    chapter_fixture=true;render(&audio);
+    assert(rendered.fm && !strcmp(rendered.channel,"机核 FM") && !rendered.current_chapter);
+    assert(!strcmp(rendered.title,"FM current") && !strcmp(rendered.next_chapter,"FM next"));
+    fire(BSP_BTN_UP,BSP_BTN_LONG);fire(BSP_BTN_UP,BSP_BTN_LONG);fire(BSP_BTN_UP,BSP_BTN_RELEASE);
+    assert(!seeks && !pauses && !scrub.active);
+    fire(BSP_BTN_UP,BSP_BTN_CLICK);assert(volume==55);
+    fire(BSP_BTN_OK,BSP_BTN_CLICK);assert(pauses==1 && pause_commands[0]);
+    /* Exercise the actual FM guard even with a nonempty episode identity. */
+    strcpy(current.guid,"would-save-without-fm-guard");playing_channel=0;
+    assert(save_playback(123,false)==ESP_OK && playback_saves==1);
+    playing_channel=-1;current.guid[0]=0;audio.state=PASSPORT_AUDIO_PAUSED;
+    fire(BSP_BTN_OK,BSP_BTN_CLICK);assert(pauses==2 && !pause_commands[1] && !busy);
+    assert(fm_starts==1 && playback_saves==1 && !seeks);
+    /* Maintenance restarts the station, not the placeholder episode URL. */
+    page=PASSPORT_PAGE_SETTINGS;audio.state=PASSPORT_AUDIO_PLAYING;
+    assert(begin(JOB_REFRESH,0,0,0,false));run_catalog_worker();assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(result.restart && finish_catalog_result(&result));assert(fm_starts==2 && plays==0 && !seek_feedback.active);
+    setup(PASSPORT_PAGE_SETTINGS);connected=false;fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    assert(page==PASSPORT_PAGE_WIFI && !job_starts && !fm_starts);
+    setup(PASSPORT_PAGE_SETTINGS);stop_error=ESP_FAIL;fire(BSP_BTN_OK,BSP_BTN_CLICK);
+    run_catalog_worker();assert(xQueueReceive(results,&result,0)==pdTRUE);assert(finish_catalog_result(&result));
+    assert(!current_fm && !fm_starts && !timeline_releases);
+}
+static void test_missing_timeline_retry_and_first_chapter_fallback(void) {
+    setup(PASSPORT_PAGE_LIBRARY);current=catalog_episode;playing_channel=0;timeline_ready=false;
+    play(0,false);assert(page==PASSPORT_PAGE_PLAYER && last_job_kind==JOB_CHAPTERS && !plays);
+    chapter_error=ESP_FAIL;chapter_retry_error=ESP_OK;run_catalog_worker();result_t result;
+    assert(xQueueReceive(results,&result,0)==pdTRUE && result.error==ESP_OK && result.restart);
+    assert(chapter_attempts==2 && retry_delays==1 && finish_catalog_result(&result) && plays==1);
+    chapter_fixture=true;before_first=true;render(&audio);
+    assert(strstr(rendered.current_chapter,"05:00") && strstr(rendered.next_chapter,"10:00"));
+    setup(PASSPORT_PAGE_LIBRARY);current=catalog_episode;playing_channel=0;timeline_ready=false;chapter_error=ESP_ERR_NOT_FOUND;
+    play(0,false);run_catalog_worker();assert(xQueueReceive(results,&result,0)==pdTRUE);
+    assert(chapter_attempts==1 && !retry_delays && result.error==ESP_ERR_NOT_FOUND);
+    assert(finish_catalog_result(&result) && plays==1); /* Missing chapters do not block playback. */
+    setup(PASSPORT_PAGE_LIBRARY);current=catalog_episode;playing_channel=0;timeline_ready=false;connected=false;
+    play(0,false);assert(page==PASSPORT_PAGE_PLAYER && !job_starts); /* Navigation works offline. */
 }
 int main(void) {
     test_volume_direction_and_limits(); test_scrub_preview_commits_once_on_matching_release();
@@ -405,6 +691,13 @@ int main(void) {
     test_home_tabs_and_selection_are_separate(); test_settings_reindexed_without_redundant_pages();
     test_render_home_identity_marker_and_next_chapter();
     test_catalog_worker_reclaimed_before_audio();
-    puts("Passport main actual handle/play: PASS (13 scenario groups; volume, deferred seek, completion feedback, wake swallowing, blanking, AP exit and identity-preserving navigation)");
+    test_channel_is_part_of_playback_identity();test_timeline_survives_directory_eviction_without_lookup();
+    test_refresh_keeps_accepted_seek_and_pause_intent();test_refresh_preserves_selected_identity_after_reorder();
+    test_refresh_updates_every_channel_after_partial_failure();
+    test_per_episode_resume_before_preparation();
+    test_conditional_settings_return_is_navigation();test_daily_refresh_and_refresh_notice();
+    test_actual_refresh_timestamp_transaction();
+    test_fm_entry_lifecycle_and_no_episode_history();test_missing_timeline_retry_and_first_chapter_fallback();
+    puts("Passport main actual handle/play: PASS (24 scenario groups; FM lifecycle/history/seek guards, timeline retry, volume, seek feedback, wake/AP handling, per-episode history, conditional player return, persisted daily refresh)");
     return 0;
 }

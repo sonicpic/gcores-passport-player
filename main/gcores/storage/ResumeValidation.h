@@ -7,7 +7,7 @@ namespace gpp {
 inline bool validResumeIdentity(uint8_t channel, uint8_t episode, uint8_t completed,
     const char *guid, size_t guid_size, const char *url, size_t url_size,
     const char *title, size_t title_size) {
-    if (channel >= 5 || (episode >= 5 && episode != UINT8_MAX) || completed > 1 ||
+    if (channel >= 5 || (episode > 100 && episode != UINT8_MAX) || completed > 1 ||
         !guid || !url || !title || !guid_size || !url_size || !title_size ||
         !std::memchr(guid, 0, guid_size) || !std::memchr(url, 0, url_size) ||
         !std::memchr(title, 0, title_size) || !guid[0] || !title[0]) return false;

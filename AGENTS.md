@@ -31,7 +31,8 @@ retain the separate authorization requirements for flashing, Git writes, and pub
 - Target: ESP32-C3, 8 MB Flash, no PSRAM, ESP-IDF 5.5.3.
 - The application partition contract follows `partitions.csv`: NVS at 0x9000
   (0x26000 bytes), PHY at 0x2F000 (0x1000 bytes), and factory application at
-  0x30000 (0x7D0000 bytes). Validate offsets and stored-data compatibility
+  0x30000 (0x4D0000 bytes), and transactional catalog cache at 0x500000
+  (0x300000 bytes). Validate offsets and stored-data compatibility
   before changing this layout; generic template layouts are reference only.
 - Preserve existing user changes. Start with `git status --short --branch`; never overwrite or clean unrelated files.
 - Flashing new firmware does not require backing up the firmware already on the device; do not make a Flash readback a prerequisite. This does not guarantee preservation of user data or authorize a full-chip erase. Follow the [flashing and data policy](docs/development/engineering/firmware-layout.md#flashing-and-stored-data).

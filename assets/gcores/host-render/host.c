@@ -12,6 +12,25 @@ LV_FONT_DECLARE(passport_cjk_16);
 LV_FONT_DECLARE(passport_hint_12);
 LV_FONT_DECLARE(passport_sans_14);
 
+LV_FONT_DECLARE(passport_cjk_bold_22);
+LV_FONT_DECLARE(passport_cjk_12);
+static void verify_standard_fonts(void) {
+    FILE *f=fopen("../../fonts/standard-characters/characters.txt","rb");assert(f);
+    unsigned char data[40000];size_t n=fread(data,1,sizeof(data),f);fclose(f);
+    const lv_font_t *fonts[]={&passport_cjk_bold_22,&passport_cjk_16,&passport_cjk_12};
+    unsigned count=0,supplementary=0;
+    for(size_t i=0;i<n;) {
+        uint32_t cp=data[i++];if(cp=='\n'||cp=='\r') continue;
+        unsigned rest=cp<0x80?0:cp<0xE0?1:cp<0xF0?2:3;
+        if(rest) cp&=(1u<<(6-rest))-1;
+        while(rest--) {assert(i<n&&(data[i]&0xC0)==0x80);cp=(cp<<6)|(data[i++]&0x3F);}
+        for(unsigned j=0;j<3;j++) {lv_font_glyph_dsc_t g={0};assert(lv_font_get_glyph_dsc(fonts[j],&g,cp,0)&&!g.is_placeholder);}
+        count++;if(cp>0xFFFF) supplementary++;
+    }
+    assert(count==8105&&supplementary==196);
+    for(unsigned j=0;j<3;j++) {lv_font_glyph_dsc_t g={0};assert(!lv_font_get_glyph_dsc(fonts[j],&g,0x1F600,0)||g.is_placeholder);}
+    puts("PASS all 8105 standard Chinese glyphs at three sizes, including 196 supplementary characters; unsupported emoji boundary");
+}
 static uint8_t framebuffer[240*320*3];
 static uint16_t draw_buffer[240*40];
 static lv_obj_t *player_title_object(lv_obj_t *parent) {
@@ -66,6 +85,7 @@ int main(void)
 {
     setbuf(stdout,NULL);
     lv_init();
+    verify_standard_fonts();
     lv_display_t *display=lv_display_create(240,320);
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(display,draw_buffer,NULL,sizeof(draw_buffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -98,7 +118,7 @@ int main(void)
         if(p==1) {v.hint=hints[7];v.current_chapter="21:10 测试章节标题";}
         if(p==2) {v.titles[0]="机核游戏频道";v.titles[1]="机核生活频道";v.titles[2]="机核音频频道";v.titles[3]="机核 PRO";v.titles[4]="核市奇谭";v.hint=hints[2];}
         if(p==3) {v.titles[0]="更新播客列表";v.titles[1]="Wi-Fi 配网";v.titles[2]="亮度：70%";v.titles[3]="自动息屏：60 秒";v.titles[4]="定时停止：关闭";v.hint=hints[4];}
-        if(p==4) {v.status="手机连接热点\nGcores-Passport\n密码：ABCDEFGHIJKL\n浏览器打开\nhttp://192.168.4.1\n使用 2.4 GHz 网络";v.hint=hints[5];}
+        if(p==4) {v.status="保存中\n手机连接热点\nGcores-Passport\n密码：ABCDEFGHIJKL\n浏览器打开\nhttp://192.168.4.1\n使用 2.4 GHz 网络";v.hint=hints[5];}
         if(p==5) {v.titles[0]="00:00 开场";v.titles[1]="06:20 第一段声音";v.titles[2]="21:10 记忆的回声";v.titles[3]="38:40 游戏与音乐";v.titles[4]="55:30 尾声";v.hint=hints[3];}
         if(p==6) {v.item_count=0;v.status="首页：上下选节目，OK播放\n长按上下切频道，长按OK设置\n播放：上下音量，OK播放暂停\n长按上下调进度，松手定位\n设置：上下选择，OK调整\n播放/设置：长按OK回首页\n双击OK息屏，任意键唤醒\n深睡停止播放，保存进度";v.hint=hints[6];}
         if(p==7) {v.page=PASSPORT_PAGE_SETTINGS;v.selected=4;v.item_count=5;v.titles[0]="定时停止：关闭";v.titles[1]="息屏（继续播放）";v.titles[2]="停止并深睡";v.titles[3]="按键帮助";v.titles[4]="按键帮助";v.hint=hints[4];}
@@ -123,6 +143,12 @@ int main(void)
             if(p==6) {lv_point_t size;lv_text_get_size(&size,v.status,&passport_cjk_16,0,0,216,LV_TEXT_FLAG_NONE);assert(size.y<=198);}
         }
 
+        if(p==0||p==3) {
+            const int black_points[][2]={{5,100},{230,180},{120,276},{17,84}};
+            for(unsigned k=0;k<4;k++) {unsigned idx=(black_points[k][1]*240+black_points[k][0])*3;
+                assert(framebuffer[idx]==0&&framebuffer[idx+1]==0&&framebuffer[idx+2]==0);}
+            puts("PASS home/settings actual middle background and row fill are pure black");
+        }
         char path[100];snprintf(path,sizeof(path),"%s.ppm",names[p]);
         FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n240 320\n255\n");fwrite(framebuffer,1,sizeof(framebuffer),f);fclose(f);
         lv_mem_monitor_t monitor;lv_mem_monitor(&monitor);
@@ -217,7 +243,7 @@ int main(void)
         .channel="机核电台",.current_chapter=long_title,.status="网络已连接",.hint=hints[7],.battery_percent=-1};
     for(int pass=0;pass<3;pass++) for(int p=0;p<9;p++) {
         stress.page=(passport_page_t)p;
-        stress.status=p==4?"手机连接热点\nGcores-Passport\n密码：ABCDEFGHIJKL\n浏览器打开\nhttp://192.168.4.1\n使用 2.4 GHz 网络":"网络已连接";
+        stress.status=p==4?"保存中\n手机连接热点\nGcores-Passport\n密码：ABCDEFGHIJKL\n浏览器打开\nhttp://192.168.4.1\n使用 2.4 GHz 网络":"网络已连接";
         passport_ui_update(&stress);lv_refr_now(display);
     }
     lv_mem_monitor_t monitor;lv_mem_monitor(&monitor);
@@ -264,6 +290,80 @@ int main(void)
     }
     printf("PASS eight repeated page/footer lifecycle cycles: free=%lu largest=%lu peak=%lu\n",
         (unsigned long)monitor.free_size,(unsigned long)monitor.free_biggest_size,(unsigned long)monitor.max_used);
+    assert(lv_mem_test()==LV_RESULT_OK);
+    passport_view_t update={.page=PASSPORT_PAGE_SETTINGS,.item_count=5,.selected=0,
+        .titles={"回到当前播放","更新播客列表","Wi-Fi 配网","亮度：70%","自动息屏：60 秒"},
+        .row_highlight={true},.updating_catalog=true,.status="正在更新节目库，请稍后……"};
+    passport_ui_update(&update);lv_refr_now(display);
+    lv_obj_t *settings_notice=label_at(lv_screen_active(),12,267);assert(settings_notice);
+    assert(!strcmp(lv_label_get_text(settings_notice),update.status));
+    assert(lv_label_get_long_mode(settings_notice)==LV_LABEL_LONG_SCROLL);
+    unsigned highlight_pixel=(97*240+22)*3;
+    assert(framebuffer[highlight_pixel]>30 && framebuffer[highlight_pixel]>framebuffer[highlight_pixel+1]);
+    FILE *highlight_file=fopen("settings-return.ppm","wb");assert(highlight_file);
+    fprintf(highlight_file,"P6\n240 320\n255\n");fwrite(framebuffer,1,sizeof(framebuffer),highlight_file);fclose(highlight_file);
+    update.page=PASSPORT_PAGE_PLAYER;update.playback_state="READY";
+    passport_ui_update(&update);lv_refr_now(display);
+    lv_obj_t *player_notice=notice_object(lv_screen_active());assert(player_notice);
+    assert(!strcmp(lv_label_get_text(player_notice),update.status) && !lv_obj_is_hidden(player_notice));
+    assert(lv_obj_get_width(player_notice)==216 && lv_label_get_long_mode(player_notice)==LV_LABEL_LONG_SCROLL);
+    passport_ui_set_active(false);assert(lv_label_get_long_mode(player_notice)==LV_LABEL_LONG_CLIP);
+    passport_ui_set_active(true);assert(lv_label_get_long_mode(player_notice)==LV_LABEL_LONG_SCROLL);
+    update.updating_catalog=false;update.playback_state="PAUSED";
+    passport_ui_update(&update);lv_refr_now(display);
+    assert(!strcmp(lv_label_get_text(player_notice),"已暂停") && lv_obj_get_width(player_notice)==100);
+    puts("PASS highlighted return row and full catalog update notices in Settings/Player, sleep animation pause and transient notice restoration");
+    update=(passport_view_t){.page=PASSPORT_PAGE_SETTINGS,.item_count=5,.selected=1,
+        .titles={"回到当前播放","机核 FM","更新播客列表","Wi-Fi 配网","亮度：70%"},
+        .row_highlight={true,true},.row_icon={1,2}};
+    passport_ui_update(&update);lv_refr_now(display);
+    FILE *fm_file=fopen("settings-fm.ppm","wb");assert(fm_file);
+    fprintf(fm_file,"P6\n240 320\n255\n");fwrite(framebuffer,1,sizeof(framebuffer),fm_file);fclose(fm_file);
+    update.page=PASSPORT_PAGE_PLAYER;update.fm=true;update.title="游戏里的声音与记忆";
+    update.next_chapter="电台里的一封来信，游戏与生活的交点";
+    update.channel="机核 FM";update.playback_state="READY";update.playing=true;
+    passport_ui_update(&update);lv_refr_now(display);
+    assert(lv_obj_is_hidden(label_at(lv_screen_active(),12,155)));
+    assert(lv_obj_is_hidden(label_at(lv_screen_active(),120,155)));
+    lv_obj_t *fm_prefix=label_at(lv_screen_active(),102,86);
+    lv_obj_t *fm_upcoming=label_at(lv_screen_active(),102,102);
+    assert(fm_prefix&&!strcmp(lv_label_get_text(fm_prefix),"即将播放"));
+    assert(fm_upcoming&&!strcmp(lv_label_get_text(fm_upcoming),update.next_chapter));
+    assert(lv_obj_get_width(fm_upcoming)==127&&lv_obj_get_height(fm_upcoming)==20);
+    assert(lv_label_get_long_mode(fm_upcoming)==LV_LABEL_LONG_SCROLL);
+    fm_file=fopen("player-fm.ppm","wb");assert(fm_file);
+    fprintf(fm_file,"P6\n240 320\n255\n");fwrite(framebuffer,1,sizeof(framebuffer),fm_file);fclose(fm_file);
+    uint8_t fm_bars[127*20*3];
+    for(int y=0;y<20;y++) memcpy(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3);
+    lv_tick_inc(300);lv_timer_handler();lv_refr_now(display);
+    bool changed=false;
+    for(int y=0;y<20;y++) if(memcmp(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3)) changed=true;
+    assert(changed);
+    for(int i=0;i<30;i++) {lv_tick_inc(100);lv_timer_handler();}
+    int32_t fm_offset=((lv_label_t *)fm_upcoming)->offset.x;assert(fm_offset<0);
+    passport_ui_update(&update);lv_refr_now(display);
+    assert(((lv_label_t *)fm_upcoming)->offset.x==fm_offset);
+    passport_ui_set_active(false);lv_refr_now(display);
+    for(int y=0;y<20;y++) memcpy(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3);
+    lv_tick_inc(1000);lv_timer_handler();lv_refr_now(display);
+    for(int y=0;y<20;y++) assert(!memcmp(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3));
+    passport_ui_set_active(true);update.playing=false;update.playback_state="PAUSED";
+    passport_ui_update(&update);lv_refr_now(display);
+    for(int y=0;y<20;y++) memcpy(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3);
+    lv_tick_inc(1000);lv_timer_handler();lv_refr_now(display);
+    for(int y=0;y<20;y++) assert(!memcmp(fm_bars+y*127*3,framebuffer+((124+y)*240+102)*3,127*3));
+    update.title=long_title;update.next_chapter=long_title;
+    passport_ui_update(&update);lv_refr_now(display);
+    assert(!strcmp(lv_label_get_text(fm_upcoming),long_title));
+    for(int i=0;i<8;i++) {
+        update.fm=false;update.next_chapter="32:40 测试章节";passport_ui_update(&update);lv_refr_now(display);
+        assert(label_at(lv_screen_active(),157,127));
+        update.fm=true;update.next_chapter="下一节目测试";passport_ui_update(&update);lv_refr_now(display);
+        assert(label_at(lv_screen_active(),102,102));assert(lv_mem_test()==LV_RESULT_OK);
+    }
+    lv_mem_monitor(&monitor);
+    printf("PASS FM names, scrolling, 4 Hz activity, sleep/pause stop, repeated FM/podcast switch; pool used=%lu peak=%lu\n",
+        (unsigned long)(monitor.total_size-monitor.free_size),(unsigned long)monitor.max_used);
     assert(lv_mem_test()==LV_RESULT_OK);
     return 0;
 }

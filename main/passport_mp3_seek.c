@@ -56,19 +56,33 @@ bool passport_mp3_seek_parse(passport_mp3_seek_t *s, const uint8_t *b,
     return true;
 }
 
+bool passport_mp3_seek_proportional(passport_mp3_seek_t *s, const uint8_t *b,
+                                    size_t size, uint32_t offset, uint64_t total,
+                                    uint32_t duration) {
+    passport_mp3_frame_t f;
+    if (!s || !b || size<4 || !passport_mp3_header(b,&f) || size<f.bytes ||
+        !duration || duration>30U*24U*3600U || total>UINT32_MAX || total<=offset || total-offset<f.bytes)
+        return false;
+    *s=(passport_mp3_seek_t){.audio_offset=offset,.audio_bytes=(uint32_t)(total-offset),
+        .sample_rate=f.sample_rate,.frame_samples=f.samples,
+        .proportional_seconds=duration,.valid=true};
+    return true;
+}
+
 bool passport_mp3_seek_plan(const passport_mp3_seek_t *s, uint32_t seconds,
                             passport_mp3_seek_plan_t *p) {
-    if (!s || !p || !s->valid || !s->frames || !s->sample_rate || !s->audio_bytes ||
+    if (!s || !p || !s->valid || (!s->frames && !s->proportional_seconds) || !s->sample_rate || !s->audio_bytes ||
         (s->frame_samples!=576 && s->frame_samples!=1152) || s->frames>s->audio_bytes/24U ||
-        (!s->cbr && !s->has_toc)) return false;
-    uint64_t samples=(uint64_t)s->frames*s->frame_samples;
+        (!s->proportional_seconds && !s->cbr && !s->has_toc)) return false;
+    uint64_t samples=s->proportional_seconds ? (uint64_t)s->proportional_seconds*s->sample_rate :
+                     (uint64_t)s->frames*s->frame_samples;
     uint64_t target=(uint64_t)seconds*s->sample_rate;
     if (target>=samples) target=samples-1;
     /* One second of frames builds the reservoir and synthesis state; local
      * scanner/decoder must still verify actual frames before making sound. */
     uint64_t start=target>s->sample_rate ? target-s->sample_rate : 0;
     uint64_t byte;
-    if (s->cbr) {
+    if (s->cbr || s->proportional_seconds) {
         byte=(start*(1ULL<<24)/samples)*s->audio_bytes/(1ULL<<24);
     } else {
         uint64_t percent=start*100U;
@@ -106,4 +120,49 @@ bool passport_mp3_seek_sync(const uint8_t *b, size_t size,
         if (confirmed) { *offset=i; return true; }
     }
     return false;
+}
+
+int passport_mp3_prefix_step(passport_mp3_prefix_t *p, const uint8_t *b,
+                             size_t size, uint64_t total, size_t *consumed) {
+    if (!p || !b || !consumed) return PASSPORT_MP3_INVALID;
+    *consumed=0;
+    if (!p->inspected) {
+        if (size<10) return PASSPORT_MP3_NEED_MORE;
+        p->inspected=true;
+        if (!memcmp(b,"ID3",3)) {
+            if (b[3]<2 || b[3]>4 || b[4]==255 || ((b[6]|b[7]|b[8]|b[9])&128))
+                return PASSPORT_MP3_INVALID;
+            uint8_t allowed=b[3]==2 ? 0xc0 : b[3]==3 ? 0xe0 : 0xf0;
+            if (b[5]&~allowed) return PASSPORT_MP3_INVALID;
+            uint32_t tag=10U+((uint32_t)b[6]<<21)+((uint32_t)b[7]<<14)+((uint32_t)b[8]<<7)+b[9];
+            if (b[3]==4 && (b[5]&16)) tag+=10;
+            if (tag>256U*1024U || (total && tag>=total)) return PASSPORT_MP3_INVALID;
+            p->remaining=tag;
+        }
+    }
+    if (p->remaining) {
+        size_t n=p->remaining<size ? p->remaining : size;
+        p->remaining-=n; p->offset+=n; *consumed=n;
+        return PASSPORT_MP3_CONSUMED;
+    }
+    return PASSPORT_MP3_READY;
+}
+
+int passport_mp3_scan_step(passport_mp3_scan_t *s, const uint8_t *b,
+                           size_t size, uint32_t seconds, size_t *consumed) {
+    if (!s || !b || !consumed) return PASSPORT_MP3_INVALID;
+    *consumed=0;
+    if (size<4) return PASSPORT_MP3_NEED_MORE;
+    passport_mp3_frame_t f;
+    if (!passport_mp3_header(b,&f)) return PASSPORT_MP3_INVALID;
+    if (size<f.bytes) return PASSPORT_MP3_NEED_MORE;
+    if (!s->sample_rate) {
+        s->sample_rate=f.sample_rate; s->version=f.version; s->channels=f.channels;
+    } else if (f.sample_rate!=s->sample_rate || f.version!=s->version || f.channels!=s->channels)
+        return PASSPORT_MP3_INVALID;
+    uint64_t target=(uint64_t)seconds*s->sample_rate;
+    uint64_t start=target>s->sample_rate ? target-s->sample_rate : 0;
+    if (s->samples>=start) return PASSPORT_MP3_READY;
+    s->samples+=f.samples; *consumed=f.bytes;
+    return PASSPORT_MP3_CONSUMED;
 }

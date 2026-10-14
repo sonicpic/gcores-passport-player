@@ -43,9 +43,17 @@ run_static_checks() {
     "${test_dir}/test_passport_logic"
     "${python_bin}" tools/test_gcores.py
     "${python_bin}" tools/test_passport_wifi.py
+    "${python_bin}" tools/test_passport_fm.py
+    "${python_bin}" tools/test_passport_fm_client.py
+    "${python_bin}" tools/test_passport_fm_metadata.py
+    "${python_bin}" tools/test_passport_fm_names.py
     "${python_bin}" tools/test_passport_audio.py
     "${python_bin}" tools/test_passport_audio_http.py
     "${python_bin}" tools/test_passport_main.py
+    "${cc_bin}" -std=c11 -Wall -Wextra -Werror -Itests/history_stubs -Imain \
+        tests/test_passport_history.c main/passport_history.c \
+        -o "${test_dir}/test_passport_history"
+    "${test_dir}/test_passport_history"
     "${python_bin}" assets/fonts/verify-font.py
     "${cc_bin}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_demo_navigation.c main/demo_navigation.c \

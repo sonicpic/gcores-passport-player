@@ -20,36 +20,48 @@ stored here. Sources are from [notofonts/noto-cjk](https://github.com/notofonts/
 
 ## Generated fonts and budget
 
-| Symbol | Face / size | Coverage | Line / baseline | Bitmap + large descriptors |
+Dynamic Chinese text supports exactly the **8,105 characters of the 2013 Table
+of General Standard Chinese Characters**, plus the unchanged 512 supported
+ASCII, Latin-1, punctuation and full-width glyphs from the existing contract.
+This is a product character-set contract, not a subset of the current RSS feed.
+The canonical inventory, three levels, pinned provenance and checksums are in
+[standard-characters](standard-characters/README.md).
+
+| Symbol | Face / size | Actual glyphs | Line / baseline | Bitmap + large descriptors |
 | --- | --- | --- | --- | --- |
-| `passport_cjk_bold_22` | Black 22 px | Complete supported dynamic inventory | 32 / 8 px | 2,849,802 B |
-| `passport_cjk_16` | Bold 16 px | Complete supported dynamic inventory | 24 / 6 px | 1,664,216 B |
-| `passport_cjk_12` | Regular 12 px | Complete supported dynamic inventory | 17 / 4 px | 1,098,530 B |
-| `passport_sans_12` | Regular 12 px | 95 printable ASCII characters | 14 / 3 px | 2,789 B |
-| `passport_sans_14` | Regular 14 px | 95 printable ASCII characters | 17 / 4 px | 3,212 B |
-| `passport_channel_11` | Bold 11 px | ASCII plus all five fixed catalog channel labels | 13 / 3 px | 3,832 B |
-| `passport_hint_12` | Black 12 px | ASCII plus actual fixed button hints | 15 / 3 px | 6,792 B |
+| `passport_cjk_bold_22` | Black 22 px | 8,617 | 32 / 8 px | 1,121,087 B |
+| `passport_cjk_16` | Bold 16 px | 8,617 | 24 / 6 px | 655,798 B |
+| `passport_cjk_12` | Regular 12 px | 8,617 | 17 / 4 px | 433,176 B |
+| `passport_sans_12` | Regular 12 px | 95 ASCII | 14 / 3 px | 2,789 B |
+| `passport_sans_14` | Regular 14 px | 95 ASCII | 17 / 4 px | 3,212 B |
+| `passport_channel_11` | Bold 11 px | Fixed catalog labels | 13 / 3 px | 3,832 B |
+| `passport_hint_12` | Black 12 px | Fixed button hints | 15 / 3 px | 6,792 B |
 
-These estimates include 16-byte large glyph descriptors; maps and font metadata
-add a small amount. The three complete fonts together use 5,612,548 bytes. Check the linked application against the 8 MiB device and actual
-application partition in the firmware gate; do not infer fit from C-source sizes.
-Fonts stay in read-only Flash and are never copied in full to RAM.
+The three dynamic fonts use 2,210,061 bytes of bitmap and 16-byte large glyph
+descriptors, saving 3,402,487 bytes against the former 20,976-basic-CJK inventory
+at the same weights and sizes. Maps and metadata add target-dependent overhead;
+check the actual linked application in the firmware gate. Fonts remain in
+read-only Flash and are not copied in full to RAM.
 
-Every dynamic size includes all **20,976 basic CJK code points U+4E00–9FEF**,
-ASCII, Latin-1, general/CJK punctuation and full-width forms supported by these
-source faces. U+9FF0–9FFF, CJK extensions and emoji are outside the contract.
-U+3031/U+3032 are excluded because their vertical form inflates line height.
-There are currently 21,488 actual glyphs in each complete font. Dynamic programme
-and chapter titles must use a complete font, never the fixed channel/hint subset.
+The standard list includes 273 characters outside the previous basic-CJK range,
+including 196 supplementary-plane characters. All 8,105 have been checked in
+all three source faces and actual generated inventories. Traditional or rare
+characters outside this exact list, CJK extensions outside the list and emoji
+are unsupported; the UI substitutes visible `?` instead of silently omitting
+text. U+9F98 and emoji are negative probes; U+2C27C is supported because it is
+in the standard list. No programme titles are baked into images.
 
 ## Reproduction and integration
 
 Run `./generate-font.ps1` from this directory. It installs the lockfile-pinned
-`lv_font_conv@1.5.3`, regenerates the complete and ASCII fonts, then invokes
+`lv_font_conv@1.5.3`, runs `generate-standard-fonts.js` for the dynamic fonts and regenerates ASCII fonts, then invokes
 `generate-channel-font.py`, `generate-hint-font.py` and `verify-font.py`.
 Channel coverage is extracted from the actual `kChannels` table in
 `main/passport_catalog.cpp`; hint coverage comes from `main/main.c`. Regenerate
-after changing fixed labels. No live RSS data is used to shrink dynamic fonts.
+after changing fixed labels. No live RSS data is used to shrink dynamic fonts. The Node wrapper loads
+8,105 symbols from the checked-in manifest in-process, avoiding the Windows
+command-line length limit. It rejects a converter other than 1.5.3, source-list
+hash/count changes and missing source glyphs before conversion.
 
 Enable `CONFIG_LV_FONT_FMT_TXT_LARGE=y`, compile each selected font once, and
 declare its matching symbol in the application. Any fallback uses an
@@ -60,7 +72,7 @@ for mixed-script overlap. The 12 px dynamic font requires a 17 px line pitch.
 
 `python verify-font.py` checks the emitted inventory, required CJK and ASCII
 boundaries, each glyph's vertical bounds, plain 2 bpp format, symbols, fixed text
-coverage and a complete-font Flash budget. The UI validates UTF-8 and selected
+coverage and a dynamic-font Flash budget. The UI validates UTF-8 and selected
 glyph availability and replaces unsupported code points with visible `?` while
 logging their U+ value. Neither compilation nor coverage auditing proves bitmap
 decoding or device appearance; inspect actual LVGL rendering and the device.
@@ -72,12 +84,3 @@ Bold 11 px. The complete body font requires 24 px line pitch. The
 [weight comparison](font-weight-comparison.png) enlarges 240 px samples 3×;
 regenerate it with `python generate-weight-preview.py` (Pillow required). This
 source-font preview is supplementary; actual LVGL and device checks are required.
-
-## Retained pixel-font sources
-
-`Monocraft.ttf`, `Monocraft-OFL.txt`, `passport_pixel_14.c`,
-`passport_pixel_20.c` and `generate-pixel-font.ps1` are retained as optional design
-resources. They are not linked by the current sans-serif UI. Monocraft is by
-Idrees Hassan, copyright 2022, under SIL OFL 1.1. Its pinned
-[upstream source](https://github.com/IdreesInc/Monocraft/blob/50e2d1c5405e9ca19c6c697d3aad0ded5a44aef9/dist/Monocraft-ttf/Monocraft.ttf)
-has SHA-256 `262e31822e0a75be567b02320bfa092143d871e8a273e529d1c5ab0c04cd215f`.

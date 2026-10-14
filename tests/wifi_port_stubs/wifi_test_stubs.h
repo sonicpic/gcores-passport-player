@@ -13,6 +13,9 @@ void test_log_warning(const char *, const char *, ...);
 #define ESP_FAIL -1
 #define ESP_ERR_NO_MEM 0x101
 #define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+#define ESP_ERR_NVS_INVALID_LENGTH 0x110c
 #define ESP_ERR_TIMEOUT 0x107
 #define ESP_ERR_WIFI_NOT_CONNECT 0x300f
 #define ESP_ERR_WIFI_STATE 0x3006
@@ -26,10 +29,16 @@ void test_log_warning(const char *, const char *, ...);
 #define BIT6 (1u << 6)
 #define BIT7 (1u << 7)
 #define BIT8 (1u << 8)
+#define BIT9 (1u << 9)
+#define BIT10 (1u << 10)
 #define pdFALSE 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
 #define portMAX_DELAY ((unsigned)-1)
+typedef struct { bool held; } portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED {false}
+#define taskENTER_CRITICAL(p) do {assert(!(p)->held);(p)->held=true;} while(0)
+#define taskEXIT_CRITICAL(p) do {assert((p)->held);(p)->held=false;} while(0)
 typedef struct { bool held; } test_semaphore_t;
 typedef test_semaphore_t *SemaphoreHandle_t;
 SemaphoreHandle_t xSemaphoreCreateMutex(void);
@@ -56,7 +65,7 @@ esp_err_t esp_event_loop_create_default(void);
 esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, event_handler_t, void *);
 typedef struct { unsigned placeholder; } wifi_init_config_t;
 #define WIFI_INIT_CONFIG_DEFAULT() ((wifi_init_config_t){0})
-enum { WIFI_MODE_STA = 1, WIFI_MODE_APSTA, WIFI_IF_STA, WIFI_IF_AP, WIFI_AUTH_WPA2_PSK, WIFI_STORAGE_FLASH, WIFI_PS_MIN_MODEM };
+enum { WIFI_MODE_STA = 1, WIFI_MODE_APSTA, WIFI_IF_STA, WIFI_IF_AP, WIFI_AUTH_WPA2_PSK, WIFI_STORAGE_FLASH, WIFI_PS_MIN_MODEM, WIFI_STORAGE_RAM };
 typedef struct { uint8_t ssid[32], password[64]; struct { bool capable; } pmf_cfg; } test_wifi_sta_t;
 typedef struct { uint8_t ssid[32], password[64], ssid_len, channel, max_connection; int authmode; } test_wifi_ap_t;
 typedef union { test_wifi_sta_t sta; test_wifi_ap_t ap; } wifi_config_t;
@@ -98,3 +107,11 @@ esp_err_t httpd_resp_send(httpd_req_t *, const char *, int);
 esp_err_t httpd_resp_sendstr(httpd_req_t *, const char *);
 esp_err_t httpd_resp_send_err(httpd_req_t *, int, const char *);
 int httpd_req_recv(httpd_req_t *, char *, size_t);
+
+typedef unsigned nvs_handle_t;
+enum { NVS_READONLY, NVS_READWRITE };
+esp_err_t nvs_open(const char *, int, nvs_handle_t *);
+esp_err_t nvs_get_blob(nvs_handle_t, const char *, void *, size_t *);
+esp_err_t nvs_set_blob(nvs_handle_t, const char *, const void *, size_t);
+esp_err_t nvs_commit(nvs_handle_t);
+void nvs_close(nvs_handle_t);

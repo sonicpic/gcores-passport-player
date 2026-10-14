@@ -52,23 +52,29 @@ std::string attr(std::string_view el, const std::string& name, size_t maxBytes) 
 }
 }
 
-RssParser::RssParser(size_t limit, bool parseTimeline) : limit_(std::max<size_t>(1, std::min<size_t>(limit, 20))), parseTimeline_(parseTimeline) {
-  buffer_.reserve(8192);
-  episodes_.reserve(limit_);
+RssParser::RssParser(size_t limit, bool parseTimeline, EpisodeSink sink, void *context, bool requirePlayable,
+                     RssParseMode mode)
+    : limit_(std::max<size_t>(1, std::min<size_t>(limit, sink ? 100 : 20))),
+      parseTimeline_(parseTimeline), sink_(sink), sinkContext_(context), requirePlayable_(requirePlayable),
+      metadataOnly_(mode == RssParseMode::CatalogMetadata) {
+  // Constructed before opening TLS: reserve the largest retained item plus
+  // one feed chunk now, avoiding a live 16-KiB -> 32-KiB reallocation later.
+  buffer_.reserve(kMaxItemBytes + 1024);
+  if (!sink_) episodes_.reserve(limit_);
 }
 
 bool RssParser::feed(const char* data, size_t length) {
-  if (!data || length == 0 || episodes_.size() >= limit_) return true;
+  if (!data || length == 0 || complete()) return !sinkFailed_;
   // Bound transient memory even when a transport hands us a whole document.
   for (size_t p = 0; p < length && !complete(); p += 1024) {
     buffer_.append(data + p, std::min<size_t>(1024, length - p));
     consume();
   }
-  return true;
+  return !sinkFailed_;
 }
 
 void RssParser::consume() {
-  while (episodes_.size() < limit_) {
+  while (!complete()) {
     if (skippingOversize_) {
       const size_t end = buffer_.find("</item>");
       if (end == std::string::npos) { if (buffer_.size() > 64) buffer_.erase(0, buffer_.size() - 64); return; }
@@ -91,7 +97,15 @@ void RssParser::consume() {
     const size_t itemLength = end + 7;
     // parseItem only borrows these bytes; every retained field owns its result.
     // Do not erase or append to buffer_ until parsing has returned.
-    if (itemLength <= kMaxItemBytes) episodes_.push_back(parseItem(std::string_view(buffer_.data(), itemLength)));
+    if (itemLength <= kMaxItemBytes) {
+      auto item=parseItem(std::string_view(buffer_.data(), itemLength));
+      if (!requirePlayable_ || (!item.title.empty() && !item.guid.empty() && !item.enclosureUrl.empty())) {
+        if (sink_) {
+          if (!sink_(sinkContext_,std::move(item))) sinkFailed_=true;
+          else ++emitted_;
+        } else { episodes_.push_back(std::move(item)); ++emitted_; }
+      }
+    }
     else truncatedItem_ = true;
     buffer_.erase(0, itemLength);
   }
@@ -111,21 +125,37 @@ PodcastEpisode RssParser::parseItem(std::string_view item) {
   PodcastEpisode e;
   e.title = firstTag(item, {"title"}, 384);
   e.guid = firstTag(item, {"guid"}, 256);
-  e.pubDate = firstTag(item, {"pubDate", "dc:date"}, 96);
-  e.link = firstTag(item, {"link"}, 512);
+  if (!metadataOnly_) e.pubDate = firstTag(item, {"pubDate", "dc:date"}, 96);
+  if (!metadataOnly_ || e.guid.empty()) e.link = firstTag(item, {"link"}, 512);
   const std::string_view enc = element(item, "enclosure");
   e.enclosureUrl = attr(enc, "url", 1024);
-  e.enclosureType = attr(enc, "type", 64);
+  if (!metadataOnly_) e.enclosureType = attr(enc, "type", 64);
   const std::string length = attr(enc, "length", 32);
   if (!length.empty()) e.enclosureLength = std::strtoull(length.c_str(), nullptr, 10);
   if (e.guid.empty()) e.guid = !e.link.empty() ? e.link : e.enclosureUrl;
-  const bool needsTimeline = parseTimeline_ && (timelineGuid_.empty() || e.guid == timelineGuid_);
+  e.durationSeconds = parseDuration(firstTag(item, {"itunes:duration"}, 32));
+  const std::string_view chapters = element(item, "podcast:chapters");
+  e.chaptersUrl = attr(chapters, "url", 1024);
+  if (metadataOnly_) {
+    std::string().swap(e.link);
+    e.timelineParsed = e.chaptersUrl.empty();
+    return e;
+  }
+  // Flash/public snapshots bound GUIDs to 256 UTF-8 bytes. A missing GUID
+  // falls back to a longer link/URL, so compare the same bounded identity.
+  // Full enclosure URL disambiguates reused or truncated GUIDs.
+  size_t identityBytes = std::min(e.guid.size(), size_t(256));
+  while (identityBytes && identityBytes < e.guid.size() &&
+         (static_cast<unsigned char>(e.guid[identityBytes]) & 0xc0) == 0x80) --identityBytes;
+  const bool identityMatch = timelineUrl_.empty()
+      ? (timelineGuid_.empty() || e.guid == timelineGuid_)
+      : (std::string_view(e.guid.data(), identityBytes) == timelineGuid_ && e.enclosureUrl == timelineUrl_);
+  const bool needsTimeline = parseTimeline_ && identityMatch;
   std::string descriptionHtml = firstTag(item, {"description", "itunes:summary"}, 12288);
   // Metadata refresh does not need a duplicate content:encoded HTML body.
   std::string contentHtml = needsTimeline || descriptionHtml.empty()
       ? firstTag(item, {"content:encoded"}, 16384) : std::string{};
   e.author = firstTag(item, {"itunes:author", "dc:creator", "author"}, 192);
-  e.durationSeconds = parseDuration(firstTag(item, {"itunes:duration"}, 32));
   std::vector<TimelineEntry> timeline;
   if (needsTimeline) {
     if (!contentHtml.empty()) timeline = TimelineParser::parseText(contentHtml, e.durationSeconds);
@@ -135,8 +165,6 @@ PodcastEpisode RssParser::parseItem(std::string_view item) {
   e.description = text::plainSummary(descriptionHtml.empty() ? contentHtml : descriptionHtml, 384);
   const std::string_view image = element(item, "itunes:image");
   e.coverUrl = attr(image, "href", 512);
-  const std::string_view chapters = element(item, "podcast:chapters");
-  e.chaptersUrl = attr(chapters, "url", 1024);
   e.chaptersType = attr(chapters, "type", 64);
   e.timelineParsed = e.timelinePacked.empty() && e.chaptersUrl.empty();
   return e;
@@ -148,7 +176,8 @@ RssParseResult RssParser::finish() {
   result.channelTitle = tag(channelPrefix_, "title", 192);
   result.episodes = std::move(episodes_);
   result.truncatedItem = truncatedItem_;
-  result.ok = !result.episodes.empty();
+  result.emittedCount = emitted_; result.sinkFailed = sinkFailed_;
+  result.ok = emitted_ != 0 && !sinkFailed_;
   if (!result.ok) result.error = "RSS 中没有可用节目，可能是格式不完整";
   return result;
 }

@@ -39,8 +39,53 @@ BSP sleep, wake and format operations must not race the audio subsystem.
 Decoder output must be 16-bit PCM, mono or stereo, at 8–48 kHz. Stereo samples
 are averaged using 32-bit arithmetic to produce mono, preserving the source
 sample rate. A sample-rate change within a stream is rejected. HE-AAC/SBR, ALAC,
-Opus/Ogg, FLAC, HLS and encrypted media are unsupported. The forward-only parser
+Opus/Ogg, FLAC and encrypted media are unsupported. Generic HLS is unsupported;
+station mode supports the bounded Gcores FM format described below. The forward-only parser
 cannot handle non-faststart M4A.
+
+### Gcores FM compatibility
+
+The website's FM is a synchronized, finite HLS playlist rather than a live
+capture. The public `gapi/v1/radios` API selects the latest item with
+`filter[is-fm]=1`, `page[limit]=1` and `sort=-published-at`. Its detail endpoint
+with `include=media` supplies `media.attributes.audio`, currently an `.m3u8`.
+The web player uses `(current time - published-at) modulo duration`, disables
+user seeking, and resynchronizes when playback resumes.
+
+Station mode fetches the latest API item on start or resume and plays its
+unencrypted media playlist, MPEG-TS and AAC-LC. The manifest is streamed to find
+the synchronized position and retain only three segment references. TS packets,
+PAT/PMT/PES and ADTS are parsed incrementally. Compressed AAC frames before the
+initial position are discarded before decoding. The decoder stays alive across
+segment boundaries; completion of one HTTP resource does not end the station.
+
+Only one TLS connection is open. API JSON is capped at 12 KiB, and its HTTP
+connection is freed before JSON-tree parsing; temporary metadata buffers are freed before AAC
+startup. The approximately 4.3 KiB network context uses unions for manifest/TS
+state and request/RX scratch. The initial manifest is fully released before a
+worker handshake admits AAC with the existing 80 KiB free-heap threshold.
+The public playlist and segments use HTTP only on the official
+`alioss.gcores.com/uploads/fm_programs/` path; API metadata retains verified HTTPS.
+This creator-approved choice removes segment TLS allocation at the cost of
+media transport encryption and integrity protection. Other hosts remain HTTPS.
+No full playlist or audio segment is buffered. Encryption,
+master playlists, discontinuities and unsupported formats fail safely. A broken
+segment terminates the session rather than splicing damaged AAC; OK retries at
+the current station time. Valid internet time is preferred; a bounded clock wait
+falls back to the beginning if time remains unknown.
+
+The LVGL pool is 28 KiB, checked against the native long-text and page-lifecycle
+stress tests. TLS retains a 16 KiB receive limit for server records and uses a
+1 KiB outgoing fragment limit. This releases 7 KiB relative to the 32 KiB UI
+pool and 4 KiB TLS output limit. HTTP/decode stacks are 6/8 KiB and dynamic
+Wi-Fi RX/TX counts are 6/6; the audio FIFO remains
+unchanged. AAC and TLS must still be measured together on the device.
+
+FM has volume, pause, resynchronized resume and screen-off playback; ordinary
+seek, progress/timeline widgets and per-episode history are disabled. Entering FM
+saves the previous podcast position in the worker. Obsolete timeline memory is
+released before startup. API/decoder/segment heap snapshots support on-device
+validation, which must establish actual AAC/TLS headroom and continuous output.
 
 The dependency is Espressif `esp_audio_codec` 2.6.2 with the required ESP32-C3
 archives and headers. Its [modified MIT license](../../components/esp_audio_codec/LICENSE)
@@ -50,8 +95,8 @@ restricts use to Espressif products. Vendor allocations remain part of the budge
 
 | Resource | Allocation or bound |
 |---|---|
-| HTTP worker stack | 8192 bytes, persistent |
-| Decode worker stack | 12288 bytes, persistent |
+| HTTP worker stack | 6144 bytes, persistent |
+| Decode worker stack | 8192 bytes, persistent |
 | Encoded FIFO | 12 KiB, persistent |
 | Initial stream prefill | 8 KiB, unless EOF or an error arrives earlier |
 | Decoder input | 3072 bytes, allocated for playback |
@@ -116,8 +161,11 @@ not completion.
 
 ### Fast approximate MP3 seeking
 
-Info/Xing discovery requires the first complete MPEG frame to fit the initial
-3 KiB input; large ID3 tags use sequential fallback. Metadata must describe the
+Initial saved-position playback probes the initial response, then reuses the
+same Range dispatch as a manual seek before opening the decoder. It adds no
+audio buffer and preserves pause intent and newer queued commands.
+ID3 tags up to 256 KiB are skipped incrementally within the existing 3 KiB
+input buffer before the first complete MPEG frame is inspected. Metadata must describe the
 full HTTP resource, including the first MPEG byte offset and an optional trailing
 128-byte ID3v1 tag. Range seeking also requires a strong ETag and known full size.
 
@@ -138,14 +186,36 @@ Range identity, synchronization or decode failures cancel the request, reset
 FIFO/decoder/reservoir/time base, and restart at byte zero with sequential decode
 and silent sample discard. See the [MP3 seek code](../../main/passport_mp3_seek.c).
 
+### MP3 without a positioning table
+
+When the first complete MP3 frame has no usable Info/Xing plan, a nonzero RSS
+program duration and known HTTP resource size enable proportional positioning:
+`audio_offset + audio_bytes * (target - preroll) / duration`. The ID3v2 prefix
+is excluded; an unknown small terminal tag may contribute a small error. This
+is explicitly approximate, including for VBR: it does not claim that sampled
+frames prove constant bitrate or that the displayed target is the exact content
+time. Incorrect RSS duration can also shift the result. Missing/invalid duration,
+missing strong ETag, rejected Range or invalid frame synchronization retain the
+sequential fallback. Native Info/Xing metadata always takes precedence. The
+existing input/FIFO and one-second decoder preroll are reused, with no persisted
+index or additional audio allocation.
+
 ### Sequential seeking
 
-Forward seeks retain the live decoder, parser, FIFO and HTTP cursor when trusted
-fast-seek metadata is unavailable, or when the target is within three seconds of
-the live cursor. Samples are discarded to the target. Backward, ended or unknown
-cursor seeks without a usable fast path restart from zero. `play(url,
-resume_seconds)` also starts from zero and discards to the saved position. Long
-sequential jumps can take substantial time and bandwidth.
+For MP3 without a trusted Range plan, a long seek or saved-position start scans
+compressed MPEG frame headers from byte zero, counting each frame's real sample
+duration. VBR is counted by frames rather than an assumed constant bitrate. Only
+the last approximately one second is decoded to warm the reservoir and reach the
+target. The scanner retains incomplete frames in the existing input buffer,
+checks commands each frame and yields periodically; it allocates no audio index.
+It still reads the skipped prefix over the network, so long jumps take time.
+Invalid frame structure or a changing timebase disables scanning for that attempt
+and uses the decode fallback without a repeated restart loop.
+
+Nearby forward targets within three seconds retain the live decoder, parser,
+FIFO and HTTP cursor and discard samples. Other formats retain this path for
+forward seeks as well; backward, ended or unknown cursor seeks restart from zero.
+Formats without compressed-frame scanning can require long sequential decoding.
 
 Discarding leaves the DAC asleep, checks commands between frames, releases the
 compute lock after each codec call, and yields one scheduler tick after 20 ms
@@ -182,3 +252,21 @@ Host tests do not validate vendor decoding, real TLS stack depth, audible output
 or board current. Device acceptance should cover supported formats, underruns,
 pause/resume, forward/backward jumps, Range rejection/fallback, stop/sleep/wake
 and repeated resource recovery.
+
+### FM programme names
+
+A sparse `include=media.timelines` query supplies programme boundaries and titles.
+Metadata is parsed incrementally before opening AAC, with a 2 KiB resource buffer,
+a maximum 8 KiB packed table and 128 entries. One replaceable NVS blob caches the
+table and media URL for up to 24 hours, tied to the latest station identity.
+The current/next title snapshot is bounded to 384 UTF-8 bytes each. At a programme
+boundary, the network worker briefly loads the table, selects the nearby names,
+and frees it; no title-related TLS request runs during playback. If NVS writing
+fails, a bounded packed RAM table is retained for that session. Missing metadata
+falls back to audio-only playback. Names follow the initial station offset plus
+actually decoded audio time, wrapping at the station duration.
+
+The FM player uses the current programme as its large title and a scrolling
+single-line next title below the upcoming-programme label. Eight decorative bars update at 4 Hz;
+they do not sample audio or compute a spectrum, and stop while paused, hidden or
+screen-off. They require no image framebuffer.

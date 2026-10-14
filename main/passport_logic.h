@@ -3,6 +3,9 @@
 #include <stdint.h>
 typedef enum { PASSPORT_POWER_ACTIVE, PASSPORT_POWER_DIM, PASSPORT_POWER_DARK, PASSPORT_POWER_SLEEP } passport_power_stage_t;
 int passport_clamp_selection(int selection, int direction, int count);
+/* UTC seconds mapped to the user's Beijing calendar day; 0 means unsynchronized. */
+int64_t passport_catalog_day(int64_t utc_seconds);
+bool passport_catalog_update_due(int64_t utc_seconds, int64_t last_success, int64_t attempted_day);
 uint32_t passport_seek_target(uint32_t position, int delta, uint32_t duration);
 passport_power_stage_t passport_power_stage(uint64_t idle_ms, bool active_audio, bool busy, bool provisioning);
 passport_power_stage_t passport_power_stage_configured(uint64_t idle_ms, bool active_audio, bool busy, bool provisioning, uint32_t screen_timeout_ms);

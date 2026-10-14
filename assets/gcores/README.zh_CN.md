@@ -84,11 +84,24 @@ python assets/gcores/compare-player-reference.py
 python assets/fonts/verify-font.py
 ```
 
-渲染器使用 32 KiB LVGL 内存池，检查滚动、息屏与唤醒、定位反馈、完整的最长
+渲染器使用 28 KiB LVGL 内存池，检查滚动、息屏与唤醒、定位反馈、完整的最长
 UTF-8 字符串、重复创建和删除页面、字形绘制及分配器一致性。桌面分配器测量
 不等于 MCU 总 SRAM 占用，也不代表实机验证结果。
 
 ## 权利与许可
+
+列表图标使用 `references/style-11-list-icon.png`，裁出圆角方块后以 Lanczos
+抗锯齿缩小成 28 × 28 RGB565 像素。在原有坐标替换旧图标，占用 1,568 字节
+Flash，不增加运行时图像缓冲。通过 `extract-reference-assets.py` 重新生成。
+
+设置导航图标原图保存在 `references/settings-return-source.png` 与
+`references/settings-fm-source.png`。使用 Pillow 运行
+`python assets/gcores/extract-settings-icons.py`，可重新生成 `extracted/`
+中的透明 24 × 24 图标。两图保留用户提供的白色、橙色美术元素，显示尺寸
+一致，并在 32 像素高的设置行内居中。生成的 `passport_settings_icons.c`
+以 RGB565 加 A8 格式在 Flash 中保存 3,456 字节像素，不需要整图解压内存。
+仅“回到当前播放”和“机核 FM”两行绘制图标。FM 播放页复用已有背景，
+覆盖静态章节轴并隐藏进度与时间轴控件，不复制整张背景。
 
 项目源码使用 [GPL-3.0](../../LICENSE)。Noto Sans CJK SC 字体独立使用
 [SIL Open Font License](../fonts/OFL.txt)。机核名称、标志与所提供参考美术的

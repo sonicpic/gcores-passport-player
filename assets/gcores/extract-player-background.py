@@ -1,7 +1,7 @@
 """Extract the latest supplied player plate, clearing only live data fields."""
 from pathlib import Path
 import hashlib
-from PIL import Image, ImageEnhance
+from PIL import Image
 
 root = Path(__file__).resolve().parent
 source = root / 'references/style-07-player.png'
@@ -50,19 +50,9 @@ player.paste(header, (0, 0))
 home_footer = home_original.resize((240, 320), Image.Resampling.LANCZOS).crop((0, 286, 240, 320))
 settings_footer = settings_original.resize((240, 320), Image.Resampling.LANCZOS).crop((0, 286, 240, 320))
 
-# Common background samples the latest original dark texture and left computer
-# motif. Only original header/footer dividers and header artwork remain baked.
-common = original.crop((25, 120, 1060, 150)).resize((240, 320), Image.Resampling.LANCZOS)
-computer = ImageEnhance.Brightness(original.crop((20, 730, 470, 1240))).enhance(0.30)
-computer = computer.resize((100, 112), Image.Resampling.LANCZOS)
-mask = Image.new('L', computer.size)
-for y in range(computer.height):
-    for x in range(computer.width):
-        edge = min(1.0, y / 10, (computer.width - 1 - x) / 14)
-        mask.putpixel((x, y), max(0, round(255 * edge)))
-common.paste(computer, (0, 170), mask)
-common.paste(player.crop((0, 0, 240, 26)), (0, 0))
-# Common plate has no baked controls: each browser page chooses one footer.
+# Browser pages use a real pure-black fill and only retain the exact header.
+# A 240x26 Flash plate saves 141,120 bytes versus the former full-screen image.
+common = header.copy()
 
 out = root / 'extracted'
 out.mkdir(exist_ok=True)

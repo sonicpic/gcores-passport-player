@@ -15,8 +15,9 @@ typedef struct {
     uint32_t duration_seconds; /* MP3 metadata duration, else size/bitrate estimate; zero unknown. */
     uint32_t sample_rate;
     uint8_t volume;
+    bool fm; /* Synchronized station, no episode seeking/history. */
     bool seek_supported; /* Fast approximate MP3 Range when available; sequential fallback. */
-    bool position_approximate; /* Info/Xing Range mapping after a fast MP3 seek. */
+    bool position_approximate; /* Metadata or RSS/size mapping after a fast MP3 seek. */
     bool seeking; /* Accepted seek still waiting for target PCM; paused seeks await resume. */
     uint32_t seek_request_id, seek_complete_id;
     esp_err_t last_error;
@@ -29,17 +30,26 @@ typedef struct {
  * URLs are limited to 1023 bytes. No URL/credentials are written to logs.
  */
 esp_err_t passport_audio_init(void);
-esp_err_t passport_audio_play(const char *url, uint32_t resume_seconds);
+/* duration_seconds is the RSS duration (zero if unknown). Saved MP3 playback
+ * probes its first frame and reuses the manual Range path; absent Info/Xing,
+ * known duration and HTTP size allow a proportional, approximate position.
+ * Without a usable plan it scans compressed frames;
+ * formats without this path decode/discard from zero. */
+esp_err_t passport_audio_play(const char *url, uint32_t resume_seconds, uint32_t duration_seconds);
+/* Fetch the latest station and join its network-time position. */
+esp_err_t passport_audio_fm(void);
 esp_err_t passport_audio_pause(bool paused);
 esp_err_t passport_audio_stop(void);
 /* Commit a final target once after the gesture ends; UI previews must not
  * enqueue seeks. Preserves pause state; decode/discard waits for resume when
- * paused. MP3 with validated Info/Xing and strong ETag uses approximate Range
+ * paused. MP3 with validated Info/Xing or RSS duration/size and strong ETag uses approximate Range
  * plus frame sync/reservoir preroll. position_approximate distinguishes its time
- * estimate. Metadata discovery currently requires the first complete MPEG frame
- * to fit the initial 3 KiB input (large ID3 tags use the sequential fallback).
- * Nearby forward targets reuse the live cursor; formats without trusted seek
- * metadata restart from zero for backward/ended/unknown streams and may take time.
+ * estimate. ID3 tags up to 256 KiB are skipped within the existing input buffer
+ * before metadata discovery. MP3 without a usable Range plan scans compressed
+ * frame headers from zero and decodes only the final preroll; the network must
+ * still read the skipped prefix. Formats without this path decode sequentially.
+ * Nearby forward targets reuse the live cursor; backward/ended/unknown streams
+ * without a usable fast path restart from zero and may take time.
  * seeking/request/complete IDs report completion of this accepted request. */
 esp_err_t passport_audio_seek(uint32_t seconds);
 esp_err_t passport_audio_set_volume(uint8_t percent);

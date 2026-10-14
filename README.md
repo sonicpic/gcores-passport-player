@@ -2,7 +2,7 @@
 
 # Gcores Passport Player
 
-A pocket Gcores podcast player for FoloToy AI Passport, with five channels, text timelines and saved playback progress.
+A pocket Gcores podcast player for FoloToy AI Passport, with five channels, Gcores FM, text timelines and saved playback progress.
 
 ![Player UI render](assets/gcores/community/cover.png)
 
@@ -10,19 +10,20 @@ This image is a native UI render with illustrative episode text, not a device ca
 
 ## Features
 
-- Browse the latest five episodes in each of five channels: gaming, life, interests, Heshi Qitan and Yinpingxi Roaming Guide.
+- Browse up to 100 recent episodes in each of five channels: gaming, life, interests, Heshi Qitan and Yinpingxi Roaming Guide. Local paging keeps RAM bounded.
 - Play or pause, adjust volume, preview a seek target while holding a button and seek on release.
 - Read the current and upcoming chapter text directly in the player; overflowing text scrolls automatically.
-- Return to the currently playing episode without restarting it. Save progress periodically and resume after restarting.
+- Reopen the playing episode without restarting it. A bounded per-episode history saves progress periodically for returning after switching programs or restarting.
 - Listen with the screen off, set a stop timer, adjust brightness and configure automatic screen-off.
-- Configure Wi-Fi using a phone and the device's temporary setup hotspot.
+- Listen to Gcores FM with current/upcoming programme titles and lightweight radio animation.
+- Save one or two Wi-Fi networks through the temporary hotspot management page; automatically reconnect to an available saved network.
 
 ## Quick start
 
-1. On first startup, connect your phone to `Gcores-Passport` using the password on the device. Open `http://192.168.4.1`, enter a 2.4 GHz Wi-Fi name and password, and tap Save and connect. The device reports a connected network and closes its hotspot when successful.
+1. On first startup, connect your phone to `Gcores-Passport` using the password on the device. Open `http://192.168.4.1`, enter one or two 2.4 GHz Wi-Fi configurations (the second is optional), and tap Save and connect. The device reports a connected network and closes its hotspot when successful.
 2. On the home screen, press Up/Down to select an episode; hold Up/Down to switch channels left/right. Press OK to listen.
 3. In the player, Up/Down changes volume, holding Up/Down previews backward/forward positioning, and release commits the seek. OK toggles play/pause; holding OK returns home.
-4. Hold OK on the home screen to enter Settings. Double-press OK to blank the screen while listening; the first function-button press only wakes it.
+4. Hold OK on the home screen to enter Settings, where Gcores FM and Return to current playback are available. Double-press OK to blank the screen while listening; the first function-button press only wakes it.
 
 For retrying setup, changing networks and all page controls, see the [user guide](docs/development/gcores-player.md).
 

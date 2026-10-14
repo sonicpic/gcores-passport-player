@@ -91,12 +91,28 @@ python assets/gcores/compare-player-reference.py
 python assets/fonts/verify-font.py
 ```
 
-The renderer uses a 32 KiB LVGL pool. Its checks cover scrolling, display
+The renderer uses a 28 KiB LVGL pool. Its checks cover scrolling, display
 off/wake, seek feedback, complete maximum-length UTF-8 strings, repeated page
 creation/deletion, glyph drawing and allocator consistency. Native allocator
 measurements are not total MCU SRAM usage or physical-device validation.
 
 ## Rights and licenses
+
+The list badge uses `references/style-11-list-icon.png`, cropped to the rounded
+tile and downsampled with Lanczos antialiasing to 28 × 28 RGB565 pixels. It
+replaces the previous badge at the same coordinates and uses 1,568 Flash bytes
+with no extra runtime image buffer. Reproduce it with `extract-reference-assets.py`.
+
+Settings navigation artwork is retained in
+`references/settings-return-source.png` and `references/settings-fm-source.png`.
+Run `python assets/gcores/extract-settings-icons.py` with Pillow to reproduce
+the transparent 24 × 24 crops in `extracted/`. Both icons use the supplied
+white/orange artwork, have equal visible bounds, and are centered within the
+32-pixel settings rows. The generated `passport_settings_icons.c` stores
+3,456 bytes of RGB565 plus A8 pixels in Flash; it requires no whole-image
+decompression allocation. Only the current-player and FM rows draw icons.
+The FM player reuses the existing player plate, masks its fixed chapter axis,
+and hides position/timeline controls rather than duplicating the background.
 
 Project source is licensed under [GPL-3.0](../../LICENSE). Noto Sans CJK SC is
 licensed separately under the [SIL Open Font License](../fonts/OFL.txt).

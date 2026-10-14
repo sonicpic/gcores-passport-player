@@ -85,37 +85,107 @@ static void test_rss_large_item_memory_and_boundaries() {
         " </item><item><title>After</title></item></channel></rss>",5,7);
     assert(over.ok && over.truncatedItem && over.episodes.size()==1 && over.episodes[0].title=="After");
 }
+struct MetadataSinkState { size_t count=0; };
+static bool metadata_memory_sink(void *context,gpp::PodcastEpisode&& item) {
+    auto& state=*static_cast<MetadataSinkState *>(context);
+    ++state.count;
+    assert(item.title=="节目" && item.guid=="id" && item.enclosureUrl=="https://gcores.com/a.mp3");
+    assert(item.durationSeconds==10 && item.enclosureLength==123456);
+    assert(item.chaptersUrl=="https://gcores.com/c.json");
+    for (const auto *field : {&item.description,&item.contentEncoded,&item.author,&item.coverUrl,
+                             &item.pubDate,&item.enclosureType,&item.chaptersType,&item.link,&item.timelinePacked})
+        assert(field->empty());
+    assert(item.timeline.empty());
+    return true;
+}
+static void test_metadata_sink_bounded_memory() {
+    // A maximum-size realistic item with large CDATA bodies must not allocate
+    // either body while TLS is live, and 100 episodes retain no more than 5.
+    std::string item="<item><title>节目</title><guid>id</guid><pubDate>Today</pubDate>"
+        "<description><![CDATA[00:00 First<br>"+std::string(11000,'x')+"]]></description>"
+        "<content:encoded><![CDATA[00:00 First<br>"+std::string(10000,'y')+"]]></content:encoded>"
+        "<itunes:author>Author</itunes:author><itunes:image href='https://gcores.com/cover.png'/>"
+        "<enclosure url='https://gcores.com/a.mp3' type='audio/mpeg' length='123456'/>"
+        "<itunes:duration>00:10</itunes:duration><podcast:chapters url='https://gcores.com/c.json' type='application/json'/></item>";
+    item.insert(item.size()-7,24576-item.size(),' ');
+    size_t peaks[2]{},retained[2]{};
+    for (size_t test=0;test<2;++test) {
+        const size_t count=test?100:5;
+        const size_t baseline=live_bytes; peak_bytes=baseline;
+        {
+            MetadataSinkState state;
+            gpp::RssParser parser(count,false,metadata_memory_sink,&state,true,gpp::RssParseMode::CatalogMetadata);
+            const size_t reserved=live_bytes-baseline;
+            assert(reserved>=24576+1024 && reserved<27000);
+            // Simulate a live TLS allocation after the parser is constructed.
+            std::string tls(40000,'t');
+            const size_t online=live_bytes; peak_bytes=online;
+            parser.feed("<rss><channel>",14);
+            for (size_t i=0;i<count;++i) for (size_t p=0;p<item.size();p+=1024)
+                assert(parser.feed(item.data()+p,std::min(size_t(1024),item.size()-p)));
+            auto result=parser.finish();
+            assert(result.ok && result.emittedCount==count && result.episodes.empty() && state.count==count);
+            peaks[test]=peak_bytes-online;
+            retained[test]=live_bytes-online;
+        }
+        assert(live_bytes==baseline);
+    }
+    assert(peaks[0]<2048 && peaks[1]<2048 && retained[0]==retained[1]);
+    std::printf("RSS metadata TLS-time extra peak 5/100: %zu/%zu bytes; retained: %zu/%zu bytes\n",
+                peaks[0],peaks[1],retained[0],retained[1]);
+}
 static void test_catalog_current_and_identity() {
     using namespace gpp;
-    auto& channel=catalog_api_test::episodes[0];
-    PodcastEpisode episode; episode.guid="identity"; episode.enclosureUrl="https://gcores.com/current.mp3";
-    episode.timelinePacked=TimelineParser::pack({{0,"开场",{}},{100,"主题",{}}});
-    channel={episode};
-    passport_chapter_t out={}; size_t index=99;
-    auto before=allocations;
-    assert(catalog_api_test::passport_catalog_current_chapter(0,0,100,&out,&index));
+    namespace api=catalog_api_test;
+    FlashFixture flash;
+    assert(api::catalog.mount(flash.io()) && api::catalog.begin(0));
+    for (size_t i=0;i<100;++i) assert(api::catalog.append(flash_record(i)));
+    assert(api::catalog.commit());
+    const auto before=allocations;
+    passport_episode_t ep{};
+    assert(api::passport_catalog_episode_count(0)==100);
+    for (int i : {0,3,4,7,8,99}) {
+        assert(api::passport_catalog_get_episode(0,i,&ep));
+        assert(ep.duration_seconds==3600+unsigned(i));
+    }
+    assert(!api::passport_catalog_get_episode(0,100,&ep));
+    assert(!api::passport_catalog_get_episode(5,0,&ep));
+    assert(!api::passport_catalog_get_episode(0,0,nullptr));
+    assert(api::passport_catalog_find_episode_by_identity(0,"guid99","https://gcores.com/guid99.mp3")==99);
+    assert(api::passport_catalog_find_episode_by_identity(0,"guid99","https://gcores.com/guid98.mp3")==-1);
+    assert(api::passport_catalog_set_playback(0,&ep)==ESP_OK);
+    assert(api::playback_index==99);
+    assert(api::passport_catalog_episode_count(0)==100);
+    assert(allocations==before);
+    api::timeline_packed=TimelineParser::pack({{0,"开场",{}},{100,"主题",{}}});
+    std::strcpy(api::timeline_guid,ep.guid); std::strcpy(api::timeline_url,ep.url); api::timeline_channel=0;
+    passport_chapter_t out{}; size_t index=99;
+    auto allocated=allocations, reads=flash.reads;
+    assert(api::passport_catalog_current_chapter_by_identity(0,ep.guid,ep.url,100,&out,&index));
     assert(out.start_seconds==100 && std::string_view(out.title)=="主题" && index==1);
-    assert(catalog_api_test::passport_catalog_current_chapter(0,0,0,&out,nullptr));
-    assert(out.start_seconds==0 && std::string_view(out.title)=="开场");
-    assert(!catalog_api_test::passport_catalog_current_chapter(0,-1,100,&out,&index));
-    assert(!catalog_api_test::passport_catalog_current_chapter(5,0,100,&out,&index));
-    assert(!catalog_api_test::passport_catalog_current_chapter(0,0,100,nullptr,&index));
-    assert(index==1 && out.start_seconds==0);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"identity","https://gcores.com/current.mp3")==0);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"other","https://gcores.com/current.mp3")==-1);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"identity","https://gcores.com/other.mp3")==-1);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(-1,"identity","https://gcores.com/current.mp3")==-1);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,nullptr,"https://gcores.com/current.mp3")==-1);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"identity","")==-1);
-    assert(allocations==before);
-    PodcastEpisode next; next.guid="new"; next.enclosureUrl="https://gcores.com/new.mp3";
-    channel.insert(channel.begin(),next);
-    before=allocations;
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"identity","https://gcores.com/current.mp3")==1);
-    assert(!catalog_api_test::passport_catalog_current_chapter(0,0,100,&out,&index));
-    assert(allocations==before);
-    channel.erase(channel.begin()+1);
-    assert(catalog_api_test::passport_catalog_find_episode_by_identity(0,"identity","https://gcores.com/current.mp3")==-1);
+    assert(api::passport_catalog_get_chapter_by_identity(0,ep.guid,ep.url,0,&out));
+    assert(api::passport_catalog_chapter_count_by_identity(0,ep.guid,ep.url)==2);
+    assert(!api::passport_catalog_current_chapter_by_identity(0,ep.guid,"wrong",100,&out,&index));
+    assert(!api::passport_catalog_current_chapter_by_identity(0,ep.guid,ep.url,100,nullptr,&index));
+    assert(api::passport_catalog_set_playback(0,&ep)==ESP_OK);
+    assert(api::timeline_packed.size()>0 && flash.reads==reads && allocations==allocated);
+    // Transaction refresh replaces rows while retained playback/timeline survive.
+    assert(api::catalog.begin(0) && api::catalog.append(flash_record(0,"new")) && api::catalog.commit());
+    api::page_channel=-1; api::playback_index=api::catalog.find(0,ep.guid,ep.url);
+    allocated=allocations; reads=flash.reads;
+    assert(api::passport_catalog_episode_count(0)==2);
+    passport_episode_t pinned{};
+    assert(api::passport_catalog_get_episode(0,1,&pinned));
+    assert(!std::strcmp(pinned.guid,ep.guid) && !std::strcmp(pinned.url,ep.url));
+    assert(api::passport_catalog_find_episode_by_identity(0,ep.guid,ep.url)==1);
+    assert(api::passport_catalog_current_chapter_by_identity(0,ep.guid,ep.url,0,&out,nullptr));
+    assert(allocations==allocated && flash.reads==reads);
+    // A prepared timeline must survive pinning a different next source.
+    assert(api::passport_catalog_get_episode(0,0,&ep));
+    api::timeline_packed=TimelineParser::pack({{0,"Next",{}}});
+    std::strcpy(api::timeline_guid,ep.guid); std::strcpy(api::timeline_url,ep.url);
+    assert(api::passport_catalog_set_playback(0,&ep)==ESP_OK);
+    assert(api::passport_catalog_episode_count(0)==1 && api::timeline_packed.size()>0);
 }
 static void test_current_packed() {
     using namespace gpp;
@@ -173,6 +243,7 @@ static void test_current_packed() {
 int main() {
     using namespace gpp;
     test_rss_large_item_memory_and_boundaries();
+    test_metadata_sink_bounded_memory();
     test_catalog_current_and_identity();
     test_current_packed();
     const std::string xml = "<rss><channel><title>Gcores</title>"
@@ -212,6 +283,9 @@ int main() {
     assert(CacheCodec::decodeEpisodes(encoded, decoded, 5));
     const char guid[] = "saved-identity", url[] = "https://gcores.com/episode.mp3", title[] = "Episode";
     assert(validResumeIdentity(0, 255, 1, guid, sizeof(guid), url, sizeof(url), title, sizeof(title)));
+    assert(validResumeIdentity(0, 99, 0, guid, sizeof(guid), url, sizeof(url), title, sizeof(title)));
+    assert(validResumeIdentity(0, 100, 0, guid, sizeof(guid), url, sizeof(url), title, sizeof(title)));
+    assert(!validResumeIdentity(0, 101, 0, guid, sizeof(guid), url, sizeof(url), title, sizeof(title)));
     const char http_url[]="http://alioss.gcores.com/example.mp3";
     assert(validResumeIdentity(0,255,0,guid,sizeof(guid),http_url,sizeof(http_url),title,sizeof(title)));
     for(const char *invalid : {"http://", "https://", "http:///bad", "ftp://example.org/a", "http://example.org/\r\n"})

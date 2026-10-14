@@ -1,6 +1,7 @@
 #include "passport_audio.h"
 #include "passport_mp3_seek.h"
 #include "passport_audio_http.h"
+#include "passport_fm.h"
 #include "bsp_audio.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_mp3_dec.h"
@@ -34,13 +35,15 @@
 #define PCM_INITIAL_BYTES (1152 * 2 * sizeof(int16_t))
 #define NETWORK_BYTES 1024
 #define NET_IDLE (1U << 0)
+#define NET_FM_READY (1U << 1)
+#define NET_FM_DECODER (1U << 2)
 #define NET_TIMEOUT_MS 3000
 #define NET_STOP_WAIT_MS 6500
 #define HEADER_SCAN_LIMIT (256 * 1024)
 
 typedef enum { CMD_PLAY, CMD_PAUSE, CMD_STOP, CMD_SEEK, CMD_VOLUME } command_type_t;
-typedef struct { command_type_t type; uint32_t value, seek_id; char *url; } command_t;
-typedef struct { uint32_t generation; const char *url; uint64_t offset, total_bytes; char validator[128]; } net_request_t;
+typedef struct { command_type_t type; uint32_t value, seek_id, duration_seconds; bool fm; char *url; } command_t;
+typedef struct { uint32_t generation; const char *url; uint64_t offset, total_bytes; bool fm; char validator[128]; } net_request_t;
 typedef struct {
     uint32_t generation;
     bool done;
@@ -64,6 +67,7 @@ static uint32_t s_seek_active_id;
 static net_status_t s_net;
 static passport_audio_status_t s_status = { .state = PASSPORT_AUDIO_IDLE, .volume = 45 };
 static bool s_quiescent = true;
+static bool s_network_fm;
 static esp_pm_lock_handle_t s_compute_lock;
 
 static void decoder_unregister(void) {
@@ -234,11 +238,52 @@ static esp_err_t http_open(esp_http_client_handle_t http, response_t *response,
     return ESP_ERR_INVALID_RESPONSE;
 }
 
+static bool fm_cancelled(uint32_t generation) { return generation!=generation_get(); }
+static bool fm_emit(const uint8_t *bytes,size_t count,void *ctx) {
+    uint32_t generation=*(uint32_t *)ctx;
+    size_t sent=0;
+    while (sent<count && !fm_cancelled(generation))
+        sent+=xStreamBufferSend(s_stream,bytes+sent,count-sent,pdMS_TO_TICKS(50));
+    return sent==count;
+}
+
+static uint32_t fm_elapsed(void *ctx) {
+    uint32_t generation=*(uint32_t *)ctx;
+    taskENTER_CRITICAL(&s_lock);
+    uint32_t seconds=generation==s_generation?s_status.position_seconds:0;
+    taskEXIT_CRITICAL(&s_lock);
+    return seconds;
+}
+
+static esp_err_t fm_prepare(void *ctx) {
+    uint32_t generation=*(uint32_t *)ctx;
+    xEventGroupSetBits(s_net_events,NET_FM_READY);
+    for (unsigned wait=0;wait<100 && !fm_cancelled(generation);++wait) {
+        if (xEventGroupWaitBits(s_net_events,NET_FM_DECODER,pdFALSE,pdTRUE,pdMS_TO_TICKS(100)) & NET_FM_DECODER)
+            return ESP_OK;
+    }
+    return fm_cancelled(generation)?ESP_ERR_INVALID_STATE:ESP_ERR_TIMEOUT;
+}
+
 static void network_worker(void *arg) {
     (void)arg;
     net_request_t request;
     for (;;) {
         xQueueReceive(s_net_requests, &request, portMAX_DELAY);
+        if (request.fm) {
+            taskENTER_CRITICAL(&s_lock);
+            if (s_net.generation==request.generation) snprintf(s_net.mime,sizeof(s_net.mime),"audio/aac");
+            taskEXIT_CRITICAL(&s_lock);
+            esp_err_t fm_result=passport_fm_run(request.generation,fm_cancelled,fm_emit,fm_prepare,fm_elapsed,&request.generation);
+            taskENTER_CRITICAL(&s_lock);
+            if (s_net.generation==request.generation && s_generation==request.generation) {
+                s_net.error=fm_result; s_net.done=true;
+            }
+            taskEXIT_CRITICAL(&s_lock);
+            resource_log("fm_http_idle",0);
+            xEventGroupSetBits(s_net_events,NET_IDLE);
+            continue;
+        }
         uint8_t *buffer = malloc(NETWORK_BYTES);
         esp_err_t result = buffer ? ESP_OK : ESP_ERR_NO_MEM;
         uint64_t delivered = 0;
@@ -346,8 +391,8 @@ static esp_err_t network_start_at(const char *url, uint64_t offset, const char *
     taskENTER_CRITICAL(&s_lock);
     s_net = (net_status_t){ .generation = generation };
     taskEXIT_CRITICAL(&s_lock);
-    xEventGroupClearBits(s_net_events, NET_IDLE);
-    net_request_t request = { .generation = generation, .url = url, .offset=offset, .total_bytes=total };
+    xEventGroupClearBits(s_net_events, NET_IDLE|NET_FM_READY|NET_FM_DECODER);
+    net_request_t request = { .generation = generation, .url = url, .fm=s_network_fm, .offset=offset, .total_bytes=total };
     if (offset) snprintf(request.validator,sizeof(request.validator),"%s",validator);
     if (xQueueSend(s_net_requests, &request, 0) != pdPASS) {
         xEventGroupSetBits(s_net_events, NET_IDLE);
@@ -365,7 +410,7 @@ static void playback_worker(void *arg) {
     size_t input_length = 0, input_offset = 0;
     size_t pcm_bytes = 0;
     uint64_t decoded_samples = 0, discard_samples = 0, scanned = 0;
-    uint32_t target_seconds = 0, format_hz = 0;
+    uint32_t target_seconds = 0, format_hz = 0, episode_duration = 0;
     passport_mp3_seek_t mp3_seek={0};
     passport_mp3_seek_plan_t seek_plan={0};
     uint64_t position_base_samples=0;
@@ -374,6 +419,13 @@ static void playback_worker(void *arg) {
     int64_t discard_yield_at = 0;
     int64_t seek_started_us=0;
     bool seek_output_pending=false;
+    bool resume_probe_pending=false, resume_seek_ready=false;
+    bool mp3_probe_done=false, mp3_scanning=false, mp3_scan_disabled=false;
+    passport_mp3_prefix_t mp3_prefix={0};
+    passport_mp3_scan_t mp3_scan={0};
+    uint64_t mp3_scan_bytes=0;
+    int64_t mp3_scan_log_at=0;
+    bool playing_fm=false;
     bool running = false, paused = false, codec_awake = false, have_output = false, eos_flushed = false;
     // Keep config alive: the parser can defer frame-decoder creation until PCM.
     // AAC-LC only; explicitly disable SBR/HE-AAC in both supported containers.
@@ -381,7 +433,27 @@ static void playback_worker(void *arg) {
     esp_m4a_dec_cfg_t m4a_cfg = { .aac_plus_enable = false };
     command_t cmd;
     for (;;) {
-        if (xQueueReceive(s_commands, &cmd, running && !paused ? 0 : portMAX_DELAY) == pdPASS) {
+        bool received_command = xQueueReceive(s_commands, &cmd,
+                                running && (!paused || resume_seek_ready) ? 0 : portMAX_DELAY) == pdPASS;
+        if (!received_command && resume_seek_ready) {
+            /* Metadata came from this resource's verified initial response.
+             * Reuse the manual seek dispatch, without queueing a stale request
+             * behind a newer user command or advancing its completion ID. */
+            cmd = (command_t){ .type=CMD_SEEK, .value=target_seconds, .seek_id=s_seek_active_id };
+            received_command = true;
+        }
+        if (received_command && cmd.type==CMD_PAUSE && !cmd.value && playing_fm) {
+            // Rejoin the station clock rather than playing buffered old audio.
+            char *rejoin=strdup("https://www.gcores.com/radios#fm");
+            if (!rejoin) { publish(PASSPORT_AUDIO_ERROR,ESP_ERR_NO_MEM); continue; }
+            cmd=(command_t){.type=CMD_PLAY,.fm=true,.url=rejoin,.seek_id=s_seek_active_id};
+        }
+        if (received_command) {
+            if (cmd.type==CMD_PLAY || cmd.type==CMD_STOP || cmd.type==CMD_SEEK) {
+                resume_seek_ready=false;
+                resume_probe_pending=cmd.type==CMD_PLAY && cmd.value>0;
+                if (cmd.type==CMD_STOP) mp3_scanning=false;
+            }
             if (cmd.type==CMD_SEEK) s_seek_active_id=cmd.seek_id;
             else if (cmd.type==CMD_PLAY) {
                 s_seek_active_id=cmd.seek_id;
@@ -413,6 +485,7 @@ static void playback_worker(void *arg) {
                 }
             } else if (cmd.type == CMD_SEEK && url && running && decoder && have_output && format_hz &&
                        (uint64_t)cmd.value * format_hz >= position_base_samples+decoded_samples &&
+                       (!mp3_probe_done || (uint64_t)cmd.value*format_hz<=position_base_samples+decoded_samples+3U*format_hz) &&
                        (!mp3_seek.valid || !network_status().validator[0] ||
                         (uint64_t)cmd.value*format_hz<=position_base_samples+decoded_samples+3U*format_hz) &&
                        network_status().error == ESP_OK) {
@@ -451,7 +524,7 @@ static void playback_worker(void *arg) {
                     publish(PASSPORT_AUDIO_ERROR, e);
                     continue;
                 }
-                if (cmd.type == CMD_PLAY) { free(url); url = cmd.url; cmd.url = NULL; mp3_seek.valid=false; }
+                if (cmd.type == CMD_PLAY) { free(url); url = cmd.url; cmd.url = NULL; mp3_seek.valid=false; episode_duration=cmd.duration_seconds; playing_fm=cmd.fm; s_network_fm=playing_fm; }
                 target_seconds = cmd.type == CMD_STOP ? 0 : cmd.value;
                 if (cmd.type == CMD_STOP) {
                     mp3_seek.valid=false; range_mode=false;
@@ -469,6 +542,9 @@ static void playback_worker(void *arg) {
                     pcm = malloc(PCM_INITIAL_BYTES);
                     pcm_bytes = pcm ? PCM_INITIAL_BYTES : 0;
                     range_mode=fast_seek; range_synced=false; range_scan_bytes=warm_frames=warm_bytes=0;
+                    mp3_probe_done=mp3_scanning=mp3_scan_disabled=false;
+                    mp3_prefix=(passport_mp3_prefix_t){0}; mp3_scan=(passport_mp3_scan_t){0};
+                    mp3_scan_bytes=0; mp3_scan_log_at=0;
                     e = input && pcm ? (fast_seek ? network_start_at(url,seek_plan.offset,previous_net.validator,
                                                                      previous_net.total_bytes) : network_start(url)) : ESP_ERR_NO_MEM;
                     input_length = input_offset = 0;
@@ -484,9 +560,10 @@ static void playback_worker(void *arg) {
                     running = e == ESP_OK;
                     taskENTER_CRITICAL(&s_lock);
                     s_status.position_seconds = target_seconds;
-                    s_status.duration_seconds = fast_seek ? (uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate : 0;
+                    s_status.duration_seconds = fast_seek ? (mp3_seek.proportional_seconds ? mp3_seek.proportional_seconds : (uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate) : 0;
                     s_status.sample_rate = 0;
-                    s_status.seek_supported = true;
+                    s_status.fm=playing_fm;
+                    s_status.seek_supported = !playing_fm;
                     s_status.position_approximate = fast_seek;
                     taskEXIT_CRITICAL(&s_lock);
                     quiescent_set(false);
@@ -504,7 +581,24 @@ static void playback_worker(void *arg) {
             continue;
         }
         if (!running || paused) continue;
-        if (!decoder && !input_length && xStreamBufferBytesAvailable(s_stream) < 8192 &&
+        if (playing_fm && !decoder && (xEventGroupGetBits(s_net_events)&NET_FM_READY)) {
+            // Metadata HTTP and JSON have been released. Allocate AAC before
+            // segment TLS, so neither API parsing nor TLS startup overlaps it.
+            resource_log("fm_decoder_admission",0);
+            esp_audio_simple_dec_cfg_t cfg={.dec_type=ESP_AUDIO_SIMPLE_DEC_TYPE_AAC,
+                                           .dec_cfg=&aac_cfg,.cfg_size=sizeof(aac_cfg)};
+            esp_audio_err_t opened=heap_caps_get_free_size(MALLOC_CAP_INTERNAL)>=80*1024 ?
+                                      decoder_open(&cfg,&decoder) : ESP_AUDIO_ERR_MEM_LACK;
+            xEventGroupSetBits(s_net_events,NET_FM_DECODER);
+            if (opened!=ESP_AUDIO_ERR_OK) {
+                failure_log("fm_decoder_open",opened);
+                publish(PASSPORT_AUDIO_ERROR,opened==ESP_AUDIO_ERR_MEM_LACK?ESP_ERR_NO_MEM:ESP_ERR_NOT_SUPPORTED);
+                running=false; goto failed;
+            }
+            resource_log("fm_decoder_ready",0);
+        }
+        if (!decoder && !input_length && !mp3_prefix.inspected && !mp3_scanning &&
+            xStreamBufferBytesAvailable(s_stream) < 8192 &&
             !network_status().done) {
             vTaskDelay(pdMS_TO_TICKS(25));
             continue;
@@ -515,6 +609,18 @@ static void playback_worker(void *arg) {
             if (!input_length) {
                 net_status_t net = network_status();
                 if (!net.done) { publish(PASSPORT_AUDIO_BUFFERING, ESP_OK); continue; }
+                if (mp3_scanning && mp3_scan.samples && net.error==ESP_OK) {
+                    // A target beyond the actual stream finishes at its real
+                    // end; never restart/decode the whole prefix a second time.
+                    position_base_samples=mp3_scan.samples; decoded_samples=0;
+                    taskENTER_CRITICAL(&s_lock);
+                    s_status.sample_rate=mp3_scan.sample_rate;
+                    s_status.duration_seconds=mp3_scan.samples/mp3_scan.sample_rate;
+                    taskEXIT_CRITICAL(&s_lock);
+                    mp3_scanning=false; have_output=true;
+                    ESP_LOGI(TAG,"seek_scan_end target=%lu cursor=%llu",(unsigned long)target_seconds,
+                             (unsigned long long)(mp3_scan.samples/mp3_scan.sample_rate));
+                }
                 if (decoder && !range_mode && !eos_flushed && net.error == ESP_OK) {
                     // Decode any cached final frame through the normal format,
                     // mixing, skip, error and position accounting path below.
@@ -588,23 +694,91 @@ static void playback_worker(void *arg) {
                 if (input_length < 12) continue;
             }
             net_status_t net = network_status();
-            esp_audio_simple_dec_type_t type = detect_type(input, input_length, net.mime, url);
-            if (range_mode) type=ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
-            else if (type==ESP_AUDIO_SIMPLE_DEC_TYPE_MP3 && !mp3_seek.valid && !scanned) {
-                size_t first=0;
-                if (input_length>=10 && !memcmp(input,"ID3",3) &&
-                    !((input[6]|input[7]|input[8]|input[9])&0x80)) {
-                    first=10U+((uint32_t)input[6]<<21)+((uint32_t)input[7]<<14)+((uint32_t)input[8]<<7)+input[9];
-                    if (input[3]==4 && (input[5]&0x10)) first+=10;
+            if (input_offset) {
+                memmove(input,input+input_offset,input_length-input_offset);
+                input_length-=input_offset; input_offset=0;
+            }
+            esp_audio_simple_dec_type_t type = playing_fm ? ESP_AUDIO_SIMPLE_DEC_TYPE_AAC : detect_type(input, input_length, net.mime, url);
+            if (range_mode || mp3_prefix.inspected || mp3_scanning) type=ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+            if (!range_mode && type==ESP_AUDIO_SIMPLE_DEC_TYPE_MP3 && !mp3_scan_disabled && !mp3_probe_done) {
+                size_t consumed=0;
+                int step=passport_mp3_prefix_step(&mp3_prefix,input,input_length,net.total_bytes,&consumed);
+                if (step==PASSPORT_MP3_INVALID) goto range_restart_zero;
+                if (step==PASSPORT_MP3_CONSUMED) { input_offset=consumed; continue; }
+                passport_mp3_frame_t first;
+                if (step==PASSPORT_MP3_NEED_MORE || input_length<4 ||
+                    (passport_mp3_header(input,&first) && input_length<first.bytes)) {
+                    if (net.done && !xStreamBufferBytesAvailable(s_stream)) goto range_restart_zero;
+                    input_length+=xStreamBufferReceive(s_stream,input+input_length,INPUT_BYTES-input_length,pdMS_TO_TICKS(50));
+                    continue;
                 }
-                if (first+4<=input_length) {
-                    passport_mp3_frame_t frame;
-                    if (passport_mp3_header(input+first,&frame) && first+frame.bytes>input_length && first+frame.bytes<=INPUT_BYTES)
-                        input_length+=xStreamBufferReceive(s_stream,input+input_length,INPUT_BYTES-input_length,pdMS_TO_TICKS(50));
-                    if (passport_mp3_seek_parse(&mp3_seek,input+first,input_length-first,first,net.total_bytes))
-                        ESP_LOGI(TAG,"seek_metadata cbr=%d toc=%d duration=%lu",mp3_seek.cbr,mp3_seek.has_toc,
-                                 (unsigned long)((uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate));
+                if (!passport_mp3_header(input,&first)) goto range_restart_zero;
+                mp3_probe_done=true;
+                if (passport_mp3_seek_parse(&mp3_seek,input,input_length,mp3_prefix.offset,net.total_bytes))
+                    ESP_LOGI(TAG,"seek_metadata cbr=%d toc=%d duration=%lu",mp3_seek.cbr,mp3_seek.has_toc,
+                             (unsigned long)((mp3_seek.proportional_seconds ? mp3_seek.proportional_seconds : (uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate)));
+                if (!mp3_seek.valid && episode_duration && net.validator[0] &&
+                    passport_mp3_seek_proportional(&mp3_seek,input,input_length,
+                                                  mp3_prefix.offset,net.total_bytes,episode_duration))
+                    ESP_LOGI(TAG,"seek_proportional duration=%lu bytes=%lu",
+                             (unsigned long)episode_duration,(unsigned long)mp3_seek.audio_bytes);
+                // Restarted manual seeks and saved playback share Range dispatch.
+                if (target_seconds && mp3_seek.valid && !mp3_scan_disabled)
+                    resume_probe_pending=true;
+                mp3_scanning=target_seconds>0;
+            }
+            if (resume_probe_pending) {
+                resume_probe_pending=false;
+                /* Initial resume used to decode/discard from byte zero even
+                 * after Info/Xing made a safe Range jump possible. Probe only
+                 * the first frame, then enter exactly the manual seek path.
+                 * Unknown containers/metadata/validators retain exact decode
+                 * fallback; failed Range must not start another probe loop. */
+                if (mp3_seek.valid && net.validator[0] && net.total_bytes &&
+                    passport_mp3_seek_plan(&mp3_seek,target_seconds,&seek_plan) &&
+                    seek_plan.offset>mp3_seek.audio_offset) {
+                    resume_seek_ready=true;
+                    continue;
                 }
+            }
+            if (mp3_scanning) {
+                if (input_length<=128 && input_length>=3 && !memcmp(input,"TAG",3) &&
+                    net.done && !xStreamBufferBytesAvailable(s_stream)) {
+                    input_offset=input_length; continue;
+                }
+                size_t consumed=0;
+                int step=passport_mp3_scan_step(&mp3_scan,input,input_length,target_seconds,&consumed);
+                if (step==PASSPORT_MP3_INVALID) goto range_restart_zero;
+                if (step==PASSPORT_MP3_NEED_MORE) {
+                    if (net.done && !xStreamBufferBytesAvailable(s_stream)) goto range_restart_zero;
+                    input_length+=xStreamBufferReceive(s_stream,input+input_length,INPUT_BYTES-input_length,pdMS_TO_TICKS(50));
+                    continue;
+                }
+                if (step==PASSPORT_MP3_CONSUMED) {
+                    input_offset=consumed;
+                    mp3_scan_bytes+=consumed;
+                    if (esp_timer_get_time()>=mp3_scan_log_at) {
+                        ESP_LOGI(TAG,"seek_scan target=%lu cursor=%llu bytes=%llu",(unsigned long)target_seconds,
+                                 (unsigned long long)(mp3_scan.samples/mp3_scan.sample_rate),
+                                 (unsigned long long)mp3_scan_bytes);
+                        mp3_scan_log_at=esp_timer_get_time()+2000000;
+                    }
+                    if (esp_timer_get_time()>=discard_yield_at) {
+                        vTaskDelay(1); discard_yield_at=esp_timer_get_time()+20000;
+                    }
+                    continue;
+                }
+                /* Byte cursor and sample count come from every actual frame,
+                 * including VBR. Keep this same HTTP response; frame decoding
+                 * starts one second before the target to warm the reservoir.
+                 * No Range/time estimate or additional input buffer is used. */
+                mp3_scanning=false; range_mode=range_synced=true;
+                mp3_seek.sample_rate=mp3_scan.sample_rate;
+                position_base_samples=mp3_scan.samples;
+                discard_samples=(uint64_t)target_seconds*mp3_scan.sample_rate-mp3_scan.samples;
+                warm_frames=warm_bytes=0;
+                ESP_LOGI(TAG,"seek_scan_ready target=%lu samples=%llu",(unsigned long)target_seconds,
+                         (unsigned long long)mp3_scan.samples);
             }
             size_t needed_heap = type == ESP_AUDIO_SIMPLE_DEC_TYPE_MP3 ? 64 * 1024 : 80 * 1024;
             if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < needed_heap) {
@@ -744,7 +918,7 @@ decode_input:
             if (!running) goto failed;
             if (seek_output_pending) {
                 ESP_LOGI(TAG,"seek_output target=%lu approximate=%d elapsed_us=%lld",(unsigned long)target_seconds,
-                         range_mode,(long long)(esp_timer_get_time()-seek_started_us));
+                         s_status.position_approximate,(long long)(esp_timer_get_time()-seek_started_us));
                 seek_output_pending=false;
             }
             publish(PASSPORT_AUDIO_PLAYING, ESP_OK);
@@ -763,7 +937,7 @@ decode_input:
         if (!discard_samples) s_status.position_seconds = (position_base_samples+decoded_samples) / info.sample_rate;
         s_status.sample_rate = info.sample_rate;
         if (mp3_seek.valid) {
-            s_status.duration_seconds=(uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate;
+            s_status.duration_seconds=(mp3_seek.proportional_seconds ? mp3_seek.proportional_seconds : (uint64_t)mp3_seek.frames*mp3_seek.frame_samples/mp3_seek.sample_rate);
         } else if (info.bitrate && net.total_bytes) {
             uint64_t duration = net.total_bytes * 8 / info.bitrate;
             s_status.duration_seconds = duration > UINT32_MAX ? UINT32_MAX : duration;
@@ -777,6 +951,7 @@ range_restart_zero:
             if (decoder) { esp_audio_simple_dec_close(decoder); decoder=NULL; }
             (void)bsp_audio_sleep(); codec_awake=false;
             range_mode=range_synced=false; mp3_seek.valid=false;
+            mp3_scanning=false; mp3_scan_disabled=true; resume_probe_pending=resume_seek_ready=false;
             decoded_samples=discard_samples=scanned=position_base_samples=0;
             input_length=input_offset=0; format_hz=0; have_output=eos_flushed=false;
             taskENTER_CRITICAL(&s_lock); s_status.position_approximate=false; taskEXIT_CRITICAL(&s_lock);
@@ -826,16 +1001,24 @@ static esp_err_t enqueue(command_t command) {
     }
     return ESP_OK;
 }
-esp_err_t passport_audio_play(const char *url, uint32_t resume_seconds) {
+esp_err_t passport_audio_play(const char *url, uint32_t resume_seconds, uint32_t duration_seconds) {
     if (!url || strnlen(url, URL_LIMIT) >= URL_LIMIT ||
         (strncasecmp(url, "https://", 8) && strncasecmp(url, "http://", 7))) return ESP_ERR_INVALID_ARG;
     char *copy = strdup(url);
     if (!copy) return ESP_ERR_NO_MEM;
-    return enqueue((command_t){ .type = CMD_PLAY, .value = resume_seconds, .url = copy });
+    return enqueue((command_t){ .type = CMD_PLAY, .value = resume_seconds, .duration_seconds = duration_seconds, .url = copy });
+}
+esp_err_t passport_audio_fm(void) {
+    char *url=strdup("https://www.gcores.com/radios#fm");
+    if (!url) return ESP_ERR_NO_MEM;
+    return enqueue((command_t){.type=CMD_PLAY,.fm=true,.url=url});
 }
 esp_err_t passport_audio_pause(bool paused) { return enqueue((command_t){ .type = CMD_PAUSE, .value = paused }); }
 esp_err_t passport_audio_stop(void) { return enqueue((command_t){ .type = CMD_STOP }); }
-esp_err_t passport_audio_seek(uint32_t seconds) { return enqueue((command_t){ .type = CMD_SEEK, .value = seconds }); }
+esp_err_t passport_audio_seek(uint32_t seconds) {
+    passport_audio_status_t status; passport_audio_get_status(&status);
+    if (status.fm) return ESP_ERR_NOT_SUPPORTED;
+    return enqueue((command_t){ .type = CMD_SEEK, .value = seconds }); }
 esp_err_t passport_audio_set_volume(uint8_t percent) {
     return enqueue((command_t){ .type = CMD_VOLUME, .value = percent > 100 ? 100 : percent });
 }
@@ -876,17 +1059,17 @@ esp_err_t passport_audio_init(void) {
     }
     xEventGroupSetBits(s_net_events, NET_IDLE);
     TaskHandle_t net_task = NULL;
-    if (xTaskCreate(network_worker, "audio_http", 8192, NULL, 4, &net_task) != pdPASS) {
+    if (xTaskCreate(network_worker, "audio_http", 6144, NULL, 4, &net_task) != pdPASS) {
         e = ESP_ERR_NO_MEM; goto init_fail;
     }
     s_commands = commands;
     /* C3 archive audit: MP3 largest frame 1200 B, AAC-LC core <=160 B;
-     * 12 KiB includes nested calls, BSP and logs. Other codecs are disabled.
-     * Device stack watermarks still required; see gcores-audio documentation. */
-    if (xTaskCreate(playback_worker, "audio_decode", 12288, NULL, 5, NULL) != pdPASS) {
+     * MP3 seek and AAC startup measured under 4.6 KiB including BSP/logs.
+     * Retain 8 KiB and verify watermarks during physical acceptance. */
+    if (xTaskCreate(playback_worker, "audio_decode", 8192, NULL, 5, NULL) != pdPASS) {
         vTaskDelete(net_task); s_commands = NULL; e = ESP_ERR_NO_MEM; goto init_fail;
     }
-    ESP_LOGI(TAG, "C3 stream ready: FIFO 12 KiB, PCM 4608 B (max 8 KiB), HTTP RX/scratch 1 KiB, decode stack 12 KiB");
+    ESP_LOGI(TAG, "C3 stream ready: FIFO 12 KiB, PCM 4608 B (max 8 KiB), HTTP RX/scratch 1 KiB, HTTP/decode stacks 6/8 KiB");
     return ESP_OK;
 init_fail:
     vQueueDelete(commands); vQueueDelete(s_net_requests); vEventGroupDelete(s_net_events);

@@ -1,4 +1,12 @@
 #include "passport_logic.h"
+int64_t passport_catalog_day(int64_t utc_seconds) {
+    return utc_seconds>1700000000?(utc_seconds+8*3600)/86400:0;
+}
+bool passport_catalog_update_due(int64_t utc_seconds,int64_t last_success,int64_t attempted_day) {
+    int64_t day=passport_catalog_day(utc_seconds);
+    /* Future stored dates after a clock correction must not trigger a loop. */
+    return day && attempted_day!=day && passport_catalog_day(last_success)<day;
+}
 int passport_clamp_selection(int selection, int direction, int count) {
     if (count <= 0) return 0;
     int64_t value = (int64_t)selection + direction;

@@ -23,12 +23,16 @@ typedef struct {
     const char *titles[5];
     const char *details[5]; /* Optional per-row subtitle, borrowed during update. */
     uint8_t row_playback[5]; /* 0: other, 1: playing, 2: paused. */
+    bool row_highlight[5]; /* Prominent session navigation, independent of cursor. */
+    uint8_t row_icon[5]; /* 0: text only, 1: current player, 2: Gcores FM. */
     int channel_index;
     const char *channel;
     const char *current_chapter; /* Optional formatted timeline text; null/empty means unavailable. / 当前时间轴文字，可为空。 */
     const char *next_chapter;
     const char *title;
     bool playing;
+    bool fm; /* FM has no seek/progress/timeline controls. */
+    bool updating_catalog;
     const char *playback_state; /* Optional short ASCII state, e.g. BUFFERING. */
     bool wifi_connected;
     uint32_t position_seconds;

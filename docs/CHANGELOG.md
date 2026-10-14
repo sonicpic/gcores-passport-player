@@ -12,6 +12,17 @@
 
 ## Unreleased
 
+## v0.1.0-gcores-passport-player - 2026-10-14
+
+- Browse five podcast channels with up to 100 cached episodes each, local paging and a daily all-channel refresh.
+- Resume individual episodes from bounded GUID-based history; reopen the active player without restarting.
+- Improve approximate range seeking for older MP3 episodes and retry transient timeline failures.
+- Add Gcores FM with current/upcoming programme titles, scrolling text and lightweight radio animation. Public FM audio uses HTTP; station metadata uses verified HTTPS.
+- Save one or two Wi-Fi profiles in one management-page submission, support Chinese SSIDs and automatically try the other saved network when needed. Close the setup hotspot after successful submitted setup or exit.
+- Unify the three-page artwork, pure-black list/settings bodies and compact status indicators; reduce the fixed UI pool and audio worker stacks.
+- Include verified full-install and compatible application-update binaries. Existing compatible application-only updates preserve Wi-Fi, catalog and progress; full merged installs may reset stored data.
+
+
 - Added the supplied 80-byte CW2017 profile for the specified 520 mAh cell, including content/update-flag checks, verified writes, the required restart sequence, and bounded SOC-readiness polling.
 
 - Expanded the environment bootstrap document: added Espressif's Git service mirror (`git.espressif.com.cn`) as the preferred mainland-China route for ESP-IDF v5.5.3 and its submodules, documented submodule long-wait/timeout handling, in-place repair, and the pinned-commit shallow fetch for large submodules such as `esp32-wifi-lib`, warned about stale per-repository Jihulab `insteadOf` residue, and added the official offline release archive as a last-resort fallback (learned from `esp-mosaico/esp-mosaico-vibe`).

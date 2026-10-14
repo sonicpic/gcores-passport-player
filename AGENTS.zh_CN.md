@@ -26,7 +26,8 @@
 
 - 目标平台：ESP32-C3、8 MB Flash、无 PSRAM、ESP-IDF 5.5.3。
 - 应用分区契约以 `partitions.csv` 为准：NVS 位于 0x9000（大小 0x26000），
-  PHY 位于 0x2F000（大小 0x1000），factory app 位于 0x30000（大小 0x7D0000）。
+  PHY 位于 0x2F000（大小 0x1000），factory app 位于 0x30000（大小 0x4D0000），
+  事务目录缓存位于 0x500000（大小 0x300000）。
   修改布局前验证偏移和已存数据兼容性；通用模板布局仅作参考。
 - 保留用户已有修改。先执行 `git status --short --branch`，不得覆盖或清理无关文件。
 - 下载（烧录）新固件无需备份设备内原有固件，不得把读取 Flash 备份作为前置条件。这不保证保留用户数据，也不授权全片擦除；遵循[烧录与数据说明](docs/development/engineering/firmware-layout.zh_CN.md#烧录与已存数据)。

@@ -20,34 +20,39 @@ Noto Sans CJK SC 2.004 版权归 Adobe（2014–2021），按
 
 ## 生成字体与体积
 
-| 符号 | 字重与字号 | 覆盖范围 | 行高 / 基线 | 位图 + large 字形描述符 |
+动态中文严格支持 **2013 年《通用规范汉字表》的 8,105 字**，同时保留原有
+512 个 ASCII、Latin-1、标点和全角字形。这是固定产品字符集，不按当前 RSS
+节目内容缩减。规范字表、三级原始数据、固定来源与校验值见
+[standard-characters](standard-characters/README.zh_CN.md)。
+
+| 符号 | 字重与字号 | 实际字形 | 行高 / 基线 | 位图 + large 描述符 |
 | --- | --- | --- | --- | --- |
-| `passport_cjk_bold_22` | 特粗体 22 px | 完整受支持的动态文字字符集 | 32 / 8 px | 2,849,802 B |
-| `passport_cjk_16` | 粗体 16 px | 完整受支持的动态文字字符集 | 24 / 6 px | 1,664,216 B |
-| `passport_cjk_12` | 常规体 12 px | 完整受支持的动态文字字符集 | 17 / 4 px | 1,098,530 B |
-| `passport_sans_12` | 常规体 12 px | 95 个可打印 ASCII 字符 | 14 / 3 px | 2,789 B |
-| `passport_sans_14` | 常规体 14 px | 95 个可打印 ASCII 字符 | 17 / 4 px | 3,212 B |
-| `passport_channel_11` | 粗体 11 px | ASCII 与全部五个固定频道名称 | 13 / 3 px | 3,832 B |
-| `passport_hint_12` | 特粗体 12 px | ASCII 与实际固定按键提示 | 15 / 3 px | 6,792 B |
+| `passport_cjk_bold_22` | Black 特粗体 22 px | 8,617 | 32 / 8 px | 1,121,087 B |
+| `passport_cjk_16` | Bold 粗体 16 px | 8,617 | 24 / 6 px | 655,798 B |
+| `passport_cjk_12` | 常规体 12 px | 8,617 | 17 / 4 px | 433,176 B |
+| `passport_sans_12` | 常规体 12 px | 95 个 ASCII | 14 / 3 px | 2,789 B |
+| `passport_sans_14` | 常规体 14 px | 95 个 ASCII | 17 / 4 px | 3,212 B |
+| `passport_channel_11` | 粗体 11 px | 固定频道文案 | 13 / 3 px | 3,832 B |
+| `passport_hint_12` | 特粗体 12 px | 固定按键提示 | 15 / 3 px | 6,792 B |
 
-估算包含每字形 16 字节的 large 描述符；映射和字体元数据另占少量空间。
-三个完整字库合计 5,612,548 字节。固件门禁必须按 8 MiB 设备的实际应用分区
-检查链接结果，不能根据 C 源码文件大小判断能否放下。字体位于只读 Flash，
-不会整体复制到 RAM。
+三个动态字库的位图加每字形 16 字节描述符共 2,210,061 字节，相比相同字重和
+字号下原有 20,976 基本汉字字库节省 3,402,487 字节。映射与元数据另占少量
+空间，仍需固件门禁检查实际应用分区。字体位于只读 Flash，不整体复制到 RAM。
 
-每个动态字号都覆盖全部 **20,976 个基本汉字 U+4E00–9FEF**，以及字源支持的
-ASCII、Latin-1、常规与中日韩标点、全角形式。U+9FF0–9FFF、中日韩扩展区和
-emoji 不属于支持范围。U+3031/U+3032 的竖排形式会抬高行高，因此排除。
-目前每个完整字体实际包含 21,488 个字形。动态节目和章节标题必须选择完整
-字体，不能使用固定频道或按键提示子集。
+规范表含 273 个旧基本汉字范围外的字符，其中 196 个位于补充平面。
+三个字源和生成结果均已核对全部 8,105 字。表外繁体、罕见字、扩展汉字以及
+emoji 不属于支持范围；UI 用可见 `?` 替换，不静默丢字。U+9F98 和 emoji
+作为不支持的反例，U+2C27C 则因在规范表内受到支持。节目标题不烘焙成图片。
 
 ## 复现与集成
 
 在本目录执行 `./generate-font.ps1`。脚本安装由 lockfile 固定的
-`lv_font_conv@1.5.3`，重新生成完整和 ASCII 字体，然后执行
+`lv_font_conv@1.5.3`，通过 `generate-standard-fonts.js` 生成动态字库并重新生成 ASCII 字体，然后执行
 `generate-channel-font.py`、`generate-hint-font.py` 与 `verify-font.py`。
 频道字符直接取自 `main/passport_catalog.cpp` 的 `kChannels` 表，按键提示取自
-`main/main.c`。修改固定文案后重新生成。动态字库不根据当前 RSS 内容缩减。
+`main/main.c`。修改固定文案后重新生成。动态字库不根据当前 RSS 内容缩减。Node 包装脚本在进程内读取校验过的
+8,105 字清单，避免 Windows 命令行长度限制；转换器版本不是 1.5.3、数据
+校验值或数量改变、字源缺少任一规范字时，生成立即失败。
 
 启用 `CONFIG_LV_FONT_FMT_TXT_LARGE=y`，每个选用的字体仅编译一次，并在应用
 声明对应符号。fallback 使用应用自有的可写 `lv_font_t` 描述符，不能修改
@@ -65,12 +70,3 @@ LVGL 渲染和设备画面。
 频道名为 Bold11，完整正文行高为 24 px。[字重对照图](font-weight-comparison.png)
 将 240 px 样本放大三倍，可运行 `python generate-weight-preview.py` 复现（需 Pillow）。
 该字源预览仅为辅助，仍须检查真实 LVGL 和设备。
-
-## 保留的像素字体素材
-
-`Monocraft.ttf`、`Monocraft-OFL.txt`、`passport_pixel_14.c`、
-`passport_pixel_20.c` 与 `generate-pixel-font.ps1` 保留作可选设计素材，当前
-黑体 UI 不链接它们。Monocraft 作者为 Idrees Hassan，版权年份为 2022，许可
-为 SIL OFL 1.1。固定的
-[上游字源](https://github.com/IdreesInc/Monocraft/blob/50e2d1c5405e9ca19c6c697d3aad0ded5a44aef9/dist/Monocraft-ttf/Monocraft.ttf)
-SHA-256 为 `262e31822e0a75be567b02320bfa092143d871e8a273e529d1c5ab0c04cd215f`。

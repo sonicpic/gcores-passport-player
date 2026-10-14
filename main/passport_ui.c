@@ -19,6 +19,8 @@ LV_IMAGE_DECLARE(passport_footer_ok);
 LV_IMAGE_DECLARE(passport_settings_footer);
 LV_IMAGE_DECLARE(passport_home_footer);
 LV_IMAGE_DECLARE(passport_header_speaker);
+LV_IMAGE_DECLARE(passport_return_icon);
+LV_IMAGE_DECLARE(passport_fm_icon);
 #define BG 0x0C0E0E
 #define PANEL 0x141616
 #define LINE 0x303431
@@ -37,6 +39,13 @@ static lv_obj_t *progress,*times,*duration,*chapter_time,*next_time,*status,*foo
 static lv_font_t chapter_font;
 static lv_timer_t *feedback_timer;
 static bool display_active=true,player_visible,feedback_persistent;
+static bool catalog_update_visible;
+static bool fm_visible;
+static lv_obj_t *fm_wave;
+static lv_timer_t *fm_wave_timer;
+static bool fm_playing;
+static uint8_t fm_wave_phase;
+static uint8_t shown_row_icons[5];
 static int shown_volume=-1,shown_battery=-2,selected_row=-1;
 static passport_page_t last_page=(passport_page_t)-1;
 static bool last_network;
@@ -77,6 +86,11 @@ static void draw_row_art(lv_event_t *e) {
     if(last_page==PASSPORT_PAGE_SETTINGS) {
         rect(l,&c,0,31,216,1,LINE,0);
         if(index==selected_row) rect(l,&c,0,6,3,20,RED,0);
+        if(shown_row_icons[index]) {
+            lv_draw_image_dsc_t d;lv_draw_image_dsc_init(&d);
+            d.src=shown_row_icons[index]==1?&passport_return_icon:&passport_fm_icon;
+            lv_area_t a={c.x1+8,c.y1+4,c.x1+31,c.y1+27};lv_draw_image(l,&d,&a);
+        }
         return;
     }
     if(index==selected_row) {
@@ -86,6 +100,33 @@ static void draw_row_art(lv_event_t *e) {
     }
     lv_draw_image_dsc_t d;lv_draw_image_dsc_init(&d);d.src=&passport_reference_badge;
     lv_area_t a={c.x1+6,c.y1+8,c.x1+33,c.y1+35};lv_draw_image(l,&d,&a);
+}
+/* The original plate's chapter axis is painted out for FM.
+ * Draw directly: no extra image, object, timer or full-frame RAM allocation. */
+static void draw_fm_plate(lv_event_t *e) {
+    if(!fm_visible) return;
+    lv_area_t c;lv_obj_get_coords(lv_event_get_target_obj(e),&c);lv_layer_t *l=lv_event_get_layer(e);
+    rect(l,&c,101,89,13,58,BG,0);
+}
+/* Decorative radio activity, not a measured spectrum. Eight rectangles at
+ * 4 Hz require neither PCM sampling nor a canvas/image buffer. */
+static void draw_fm_wave(lv_event_t *e) {
+    lv_area_t c;lv_obj_get_coords(lv_event_get_target_obj(e),&c);
+    lv_layer_t *l=lv_event_get_layer(e);
+    static const uint8_t heights[]={4,9,15,20,13,6,17,10};
+    for(unsigned i=0;i<8;i++) {
+        unsigned h=fm_playing?heights[(i+fm_wave_phase)%8]:3;
+        rect(l,&c,4+i*15,20-h,6,h,fm_playing?RED:LINE,2);
+    }
+}
+static void fm_wave_tick(lv_timer_t *t) {
+    (void)t;fm_wave_phase=(fm_wave_phase+1)%8;
+    if(fm_wave) lv_obj_invalidate(fm_wave);
+}
+static void fm_wave_state(void) {
+    if(!fm_wave_timer) return;
+    bool active=display_active&&player_visible&&fm_visible&&fm_playing&&fm_wave;
+    if(active) lv_timer_resume(fm_wave_timer);else lv_timer_pause(fm_wave_timer);
 }
 static void clean_text(lv_obj_t *o, const char *input, char *clean, size_t capacity)
 {
@@ -142,9 +183,11 @@ static void scroll_label(lv_obj_t *o,bool active) {
 static void scroll_state(void) {
     if(player_visible) {
         scroll_label(track_title,display_active);scroll_label(chapter,display_active);scroll_label(next_chapter,display_active);
+        if(catalog_update_visible) scroll_label(play_state,display_active);
     } else if(last_page==PASSPORT_PAGE_LIBRARY) {
         for(int i=0;i<4;i++) {bool active=display_active&&rows[i]&&!lv_obj_is_hidden(rows[i]);scroll_label(row_titles[i],active);scroll_label(row_details[i],active);}
     }
+    if(!player_visible&&(last_page==PASSPORT_PAGE_LIBRARY||last_page==PASSPORT_PAGE_SETTINGS)) scroll_label(status,display_active);
 }
 static void feedback_tick(lv_timer_t *t) {visible(play_state,false);lv_timer_pause(t);}
 static void title_episode_suffix(char *title)
@@ -180,7 +223,7 @@ static void time_text(lv_obj_t *o,uint32_t seconds) {
 static void create_browser(passport_page_t page) {
     bool home=page==PASSPORT_PAGE_LIBRARY;
     bool body=page==PASSPORT_PAGE_WIFI||page==PASSPORT_PAGE_HELP||page==PASSPORT_PAGE_TIMELINE_TEXT;
-    content=box(screen,0,0,240,320,BG);
+    content=box(screen,0,0,240,320,0x000000);
     reference_image(content,0,0,&passport_common_background);
     heading=home?NULL:label(content,12,31,216,&title_font,WHITE,"播客列表");
     channel=home?label(content,12,62,216,&chapter_font,RED,""):NULL;
@@ -191,7 +234,7 @@ static void create_browser(passport_page_t page) {
         lv_obj_set_style_bg_color(tabs[i],lv_color_hex(RED),0);lv_obj_set_style_radius(tabs[i],7,0);
         }
         if(body||(home&&i==4)) continue;
-        rows[i]=box(content,12,80+i*48,216,46,PANEL);
+        rows[i]=box(content,12,80+i*48,216,46,(home||page==PASSPORT_PAGE_SETTINGS)?0x000000:PANEL);
         lv_obj_set_style_radius(rows[i],6,0);lv_obj_set_style_border_color(rows[i],lv_color_hex(RED),0);
         lv_obj_add_event_cb(rows[i],draw_row_art,LV_EVENT_DRAW_MAIN,(void *)(uintptr_t)i);
         row_titles[i]=label(rows[i],home?39:10,home?1:4,home?171:200,&body_font,WHITE,"");lv_obj_set_height(row_titles[i],24);
@@ -211,7 +254,9 @@ static void create_browser(passport_page_t page) {
     }
 }
 static void create_player(void) {
-    player=box(screen,0,0,240,320,BG);reference_image(player,0,0,&passport_player_background);visible(player,false);
+    player=box(screen,0,0,240,320,BG);
+    lv_obj_t *plate=reference_image(player,0,0,&passport_player_background);
+    lv_obj_add_event_cb(plate,draw_fm_plate,LV_EVENT_DRAW_POST,NULL);visible(player,false);
     track_title=label(player,11,31,216,&title_font,WHITE,"");lv_obj_set_height(track_title,32);
     player_channel=label(player,102,72,127,&passport_channel_11,RED,"");
     next_time=label(player,118,127,34,&passport_sans_12,MUTED,"");
@@ -251,9 +296,12 @@ void passport_ui_update(const passport_view_t *v) {
     bool accent_changed=accent!=home_accent;home_accent=accent;
     bool body=page==PASSPORT_PAGE_WIFI||page==PASSPORT_PAGE_HELP||page==PASSPORT_PAGE_TIMELINE_TEXT;
     bool page_changed=page!=last_page;
+    bool fm_changed=fm_visible!=v->fm;fm_visible=v->fm;
     player_visible=is_player;
     if(page_changed) {
         lv_timer_pause(feedback_timer);
+        if(fm_wave_timer) lv_timer_pause(fm_wave_timer);
+        fm_wave=NULL;
         if(player) {lv_obj_delete(player);player=NULL;}
         if(content) {lv_obj_delete(content);content=NULL;}
         /* Old footer children have just been deleted with content. / 清掉旧页子控件指针。 */
@@ -285,8 +333,12 @@ void passport_ui_update(const passport_view_t *v) {
         bool show=!body&&i<v->item_count&&(!is_home||i<4);
         if(!rows[i]) continue;
         visible(rows[i],show);if(!show) continue;
+        uint8_t row_icon=page==PASSPORT_PAGE_SETTINGS&&v->row_icon[i]<=2?v->row_icon[i]:0;
+        if(shown_row_icons[i]!=row_icon) {shown_row_icons[i]=row_icon;lv_obj_invalidate(rows[i]);}
+        if(page==PASSPORT_PAGE_SETTINGS) {lv_obj_set_x(row_titles[i],row_icon?39:10);lv_obj_set_width(row_titles[i],row_icon?171:200);}
         lv_obj_set_pos(rows[i],12,(is_home?80:91)+i*(is_home?46:34));lv_obj_set_height(rows[i],is_home?44:32);
-        lv_obj_set_style_bg_opa(rows[i],page==PASSPORT_PAGE_SETTINGS?LV_OPA_TRANSP:LV_OPA_70,0);if(selection_changed||accent_changed) lv_obj_invalidate(rows[i]);
+        lv_obj_set_style_bg_color(rows[i],lv_color_hex(v->row_highlight[i]?0x351916:0x000000),0);
+        lv_obj_set_style_bg_opa(rows[i],v->row_highlight[i]?LV_OPA_COVER:page==PASSPORT_PAGE_SETTINGS?LV_OPA_TRANSP:LV_OPA_70,0);if(selection_changed||accent_changed) lv_obj_invalidate(rows[i]);
         text(row_titles[i],v->titles[i]?v->titles[i]:"");
         lv_obj_set_style_text_color(row_titles[i],lv_color_hex(page==PASSPORT_PAGE_SETTINGS&&i==selected_row?RED:WHITE),0);
         if(row_details[i]) visible(row_details[i],is_home);
@@ -298,13 +350,17 @@ void passport_ui_update(const passport_view_t *v) {
         }
     }
     if(!is_player) {visible(status,true);lv_obj_set_pos(status,12,body?78:267);
-    lv_obj_set_height(status,body?198:17);lv_label_set_long_mode(status,body?LV_LABEL_LONG_WRAP:LV_LABEL_LONG_CLIP);
+    lv_obj_set_height(status,body?198:17);
+    lv_label_long_mode_t status_mode=body?LV_LABEL_LONG_WRAP:display_active?LV_LABEL_LONG_SCROLL:LV_LABEL_LONG_CLIP;
+    if(lv_label_get_long_mode(status)!=status_mode) lv_label_set_long_mode(status,status_mode);
     lv_obj_set_style_text_font(status,page==PASSPORT_PAGE_HELP?&body_font:&chapter_font,0);
     lv_obj_set_style_text_color(status,lv_color_hex(page==PASSPORT_PAGE_HELP?WHITE:MUTED),0);
     text(status,v->status?v->status:"");}
     if(is_player) {
+        if(fm_changed) lv_obj_invalidate(player);
         title_update(v->title?v->title:"选择节目开始收听");
         text(player_channel,v->channel?v->channel:"");
+        if(!v->fm) {
         const char *current=v->current_chapter?v->current_chapter:"";
         const char *split=strchr(current,' ');
         if(split&&split-current<16) {
@@ -320,9 +376,47 @@ void passport_ui_update(const passport_view_t *v) {
         lv_obj_set_pos(next_chapter,no_timeline?117:157,127);lv_obj_set_width(next_chapter,no_timeline?112:72);
         text(chapter,no_timeline?"暂无时间轴":current);
         text(next_chapter,no_timeline?"暂无时间轴":upcoming);
+        visible(chapter_time,!v->fm&&!no_timeline);visible(next_time,!v->fm&&!no_timeline);
+        visible(chapter,!v->fm);visible(next_chapter,!v->fm);
+        }
+        if(v->fm) {
+            /* Reuse both timeline labels instead of allocating duplicate text
+             * widgets. FM program names must not undergo time-prefix parsing. */
+            if(fm_changed||page_changed) {
+            visible(chapter_time,false);visible(next_time,false);
+            lv_obj_set_pos(chapter,102,86);lv_obj_set_width(chapter,127);lv_obj_set_height(chapter,17);
+            lv_obj_set_style_text_font(chapter,&chapter_font,0);
+            lv_obj_set_style_text_color(chapter,lv_color_hex(MUTED),0);
+            text(chapter,"即将播放");visible(chapter,true);
+            lv_obj_set_pos(next_chapter,102,102);lv_obj_set_width(next_chapter,127);lv_obj_set_height(next_chapter,20);
+            lv_obj_set_style_text_font(next_chapter,&body_font,0);
+            lv_obj_set_style_text_color(next_chapter,lv_color_hex(WHITE),0);
+            }
+            text(next_chapter,v->next_chapter&&v->next_chapter[0]?v->next_chapter:"节目加载中");visible(next_chapter,true);
+            if(!fm_wave) {
+                if(!fm_wave_timer) fm_wave_timer=lv_timer_create(fm_wave_tick,250,NULL);
+                fm_wave=box(player,102,124,127,20,BG);
+                lv_obj_set_style_bg_opa(fm_wave,LV_OPA_TRANSP,0);
+                lv_obj_add_event_cb(fm_wave,draw_fm_wave,LV_EVENT_DRAW_MAIN,NULL);
+            }
+            if(fm_playing!=v->playing) {fm_playing=v->playing;lv_obj_invalidate(fm_wave);}
+        } else if(fm_changed) {
+            lv_obj_set_style_text_font(chapter,&body_font,0);lv_obj_set_height(chapter,24);
+            lv_obj_set_style_text_color(chapter,lv_color_hex(WHITE),0);
+            lv_obj_set_style_text_font(next_chapter,&chapter_font,0);lv_obj_set_height(next_chapter,17);
+            lv_obj_set_style_text_color(next_chapter,lv_color_hex(MUTED),0);
+            if(fm_wave) {lv_timer_pause(fm_wave_timer);lv_obj_delete(fm_wave);fm_wave=NULL;}
+        }
+        visible(progress,!v->fm);visible(times,!v->fm);visible(duration,!v->fm);
         const char *state=v->playback_state?v->playback_state:v->playing?"ON AIR":"PAUSED";
         const char *feedback="";bool persistent=false;
-        if(!strcmp(state,"PAUSED")) {
+        catalog_update_visible=v->updating_catalog;
+        lv_obj_set_width(play_state,catalog_update_visible?216:100);
+        lv_obj_set_height(play_state,catalog_update_visible?17:38);
+        lv_label_long_mode_t feedback_mode=catalog_update_visible?(display_active?LV_LABEL_LONG_SCROLL:LV_LABEL_LONG_CLIP):LV_LABEL_LONG_WRAP;
+        if(lv_label_get_long_mode(play_state)!=feedback_mode) lv_label_set_long_mode(play_state,feedback_mode);
+        if(catalog_update_visible) {feedback="正在更新节目库，请稍后……";persistent=true;}
+        else if(!strcmp(state,"PAUSED")) {
             persistent=v->hint&&strstr(v->hint,"已选定位");
             feedback=persistent?"已选定位目标\n确定后定位":"已暂停";
         }
@@ -348,6 +442,7 @@ void passport_ui_update(const passport_view_t *v) {
     else {text(footer_left,"选择");text(footer_right,"调整/返回");}
     last_page=page;
     scroll_state();
+    fm_wave_state();
 }
 void passport_ui_set_active(bool active) {
     if(display_active==active) return;
@@ -355,4 +450,5 @@ void passport_ui_set_active(bool active) {
     if(active&&player&&feedback_persistent&&lv_label_get_text(play_state)[0]) visible(play_state,true);
     if(!active&&feedback_timer) {lv_timer_pause(feedback_timer);if(player) visible(play_state,false);}
     scroll_state();
+    fm_wave_state();
 }

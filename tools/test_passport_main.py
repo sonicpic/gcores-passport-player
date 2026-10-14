@@ -32,9 +32,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="passport-main-", dir=build) as work:
         generated = Path(work) / "passport_main_handle.h"
         signatures = ["static bool active(", "static void enter_page(", "static bool have_current(",
+                      "static bool can_return_player(",
+                      "static void catalog_refresh_succeeded(",
                       "static void screen_set_dark(",
                       "static void seek_feedback_observe(", "static esp_err_t seek_with_feedback(", "static void seek_feedback_view(",
-                      "static void worker(", "static bool begin(",
+                      "static esp_err_t save_playback(",
+                      "static void worker(", "static bool begin(", "static void auto_refresh_catalog(",
                       "static void render(", "static void play(", "static void handle(", "static bool finish_catalog_result("]
         generated.write_text("\n\n".join(extract_function(source, signature) for signature in signatures), encoding="utf-8")
         binary = Path(work) / ("main.exe" if os.name == "nt" else "main")

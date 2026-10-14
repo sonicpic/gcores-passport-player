@@ -15,7 +15,7 @@ out = root / 'extracted'
 out.mkdir(exist_ok=True)
 parts = ['/* User-supplied image crops; Flash-resident RGB565 / 用户原图裁切，Flash RGB565。 */', '#include "lvgl.h"']
 for name, bounds, size in specs:
-    crop = (Image.open(root / "references/style-10-list-icon.png").convert("RGB").crop((125,128,1128,1131))
+    crop = (Image.open(root / "references/style-11-list-icon.png").convert("RGB").crop((125,128,1128,1131))
             if name == "passport_reference_badge" else im.crop(bounds))
     crop.save(out / f'{name}-source.png')
     small = crop.resize(size, Image.Resampling.LANCZOS) if name == "passport_reference_badge" else crop.resize(size, Image.Resampling.BOX)

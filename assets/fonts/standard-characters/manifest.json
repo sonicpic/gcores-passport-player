@@ -1,0 +1,22 @@
+{
+  "standard": "通用规范汉字表 (2013)",
+  "count": 8105,
+  "levels": [
+    3500,
+    3000,
+    1605
+  ],
+  "source_commit": "d9b599a9c9cc0dd2d58cad829e285bc780cd4451",
+  "source_repository": "https://github.com/shengdoushi/common-standard-chinese-characters-table",
+  "official_source": "https://www.gov.cn/gzdt/att/att/site1/20130819/tygfhzb.pdf",
+  "sha256": {
+    "characters.txt": "2f05a159f4a10c75c8e361648cab265cc7311a31a02ba908ae37227ae2418420",
+    "level-1.txt": "79a6c710013cc86617d5db65871f59b2d67dee72415d380a2cc7145a51450fe4",
+    "level-2.txt": "d597a6e99ea7b8c41215081f824c6e8587bf1c9a3f45fb13086a826306789785",
+    "level-3.txt": "c9fbc83a9f8cd860306b218bf16c6a4cc56d7c4a22a686d403b176a0dbec7931",
+    "non-chinese-codepoints.txt": "2b0963584106d45c8f79ea9a0b940f2f3f1a2cfd775530de36fc60064eabe763"
+  },
+  "outside_previous_basic_range": 273,
+  "official_pdf_sha256": "af85c706a53d3b3bbad818bcce7415ac9a2284ea14f79fe7f54ce1248a7bdac9",
+  "non_chinese_count": 512
+}
